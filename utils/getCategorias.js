@@ -24,4 +24,4 @@ const getCategorias = async () => {
   }
 };
 
-export default getCategorias;
+module.exports = getCategorias;

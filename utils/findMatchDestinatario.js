@@ -113,8 +113,3 @@ for (const [id, { nombreCanonical, aliases }] of mapDest) {
 }
 
 module.exports = matchDestinatario;
-
-
-// matchDestinatario("ceige")
-//   .then(resultado => console.log("Match result:", resultado))
-//   .catch(err => console.error("Error en matchDestinatario:", err));

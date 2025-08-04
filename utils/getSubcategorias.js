@@ -25,4 +25,4 @@ const getSubcategorias = async (categoriaId) => {
   }
 };
 
-export default getSubcategorias
+module.exports = getSubcategorias

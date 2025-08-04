@@ -20,4 +20,4 @@ const saveNewDestinatario = async (nombre, categoriaId, subcategoriaId) => {
   }
 };
 
-export default saveNewDestinatario;
+module.exports = saveNewDestinatario;

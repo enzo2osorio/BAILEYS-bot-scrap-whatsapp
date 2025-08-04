@@ -3,8 +3,7 @@ const supabase = require("./supabase");
 async function saveDataFirstFlow(params) {
    
     const {nombre:nombre_destino, monto, fecha, hora, tipo_movimiento, medio_pago, observacion} = params
-
-    const mercado_pago_id = '3dd836b4-ff97-4b2e-968b-d36f6a487dd0';
+ 
 
     const {data: existingDestinatario, error} = await supabase
                                         .from("destinatarios")
@@ -16,6 +15,17 @@ async function saveDataFirstFlow(params) {
    if(!existingDestinatario || existingDestinatario.length === 0){
     return {error: "No existe el destinatario."};
    }
+
+   const {data: existingMedioPago, error: errorMedioPago} = await supabase
+                                        .from("metodos_pago")
+                                        .select("*")
+                                        .eq('name', medio_pago)
+                                        .single();
+
+   if(!existingMedioPago){
+    return {error: "No existe el medio de pago."};
+    }
+
 
    // Convertir fecha de dd/mm/yyyy a yyyy-mm-dd para PostgreSQL
    let fechaFormatted = null;
@@ -35,7 +45,7 @@ async function saveDataFirstFlow(params) {
                                                 monto,
                                                 fecha: fechaFormatted,
                                                 tipo_movimiento,
-                                                metodo_pago_id: mercado_pago_id,
+                                                metodo_pago_id: existingMedioPago.id,
                                                 descripcion: observacion,
                                                 created_at: new Date().toISOString()
                                             }

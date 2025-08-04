@@ -21,10 +21,14 @@ const vision = require("@google-cloud/vision");
 const destinatarios = require('./similarDestinatarios');
 const matchDestinatario = require('./utils/findMatchDestinatario');
 const supabase = require('./supabase');
+const { uploadFileToSupabase, downloadFileFromSupabase, cleanupTempFile } = require('./utils/supabaseStorage');
 const saveDataFirstFlow = require("./saveDataFirstFlow");
-const getCategorias = require('./utils/getCategorias')
+const getCategorias = require('./utils/getCategorias');
 const getSubcategorias = require('./utils/getSubcategorias');
+const getMetodosPago = require('./utils/getMetodosPago');
 const saveNewDestinatario = require('./utils/saveNewDestinatario');
+const matchMetodoPago = require('./utils/findMatchMetodoPago');
+const { startPeriodicCleanup } = require('./utils/cleanupSessionFiles');
 
 dotenv.config();
 
@@ -43,6 +47,9 @@ const STATES = {
   AWAITING_NEW_DESTINATARIO_NAME: "awaiting_new_destinatario_name",
   AWAITING_CATEGORY_SELECTION: "awaiting_category_selection",
   AWAITING_SUBCATEGORY_SELECTION: "awaiting_subcategory_selection",
+  AWAITING_MEDIO_PAGO_CONFIRMATION: "awaiting_medio_pago_confirmation",
+  AWAITING_MEDIO_PAGO_SELECTION: "awaiting_medio_pago_selection",
+    AWAITING_NEW_METODO_PAGO_NAME: "awaiting_new_metodo_pago_name",
   AWAITING_SAVE_CONFIRMATION: "awaiting_save_confirmation",
   AWAITING_MODIFICATION_SELECTION: "awaiting_modification_selection",
   AWAITING_DESTINATARIO_MODIFICATION: "awaiting_destinatario_modification",
@@ -80,6 +87,42 @@ app.get("/", (req, res) => {
   res.send("server working");
 });
 
+// 🧹 Endpoint para limpiar archivos de sesión manualmente
+app.post("/cleanup-session", async (req, res) => {
+  try {
+    const { cleanupSessionFiles } = require('./utils/cleanupSessionFiles');
+    await cleanupSessionFiles();
+    res.json({ 
+      success: true, 
+      message: "Limpieza de archivos de sesión completada" 
+    });
+  } catch (error) {
+    console.error("Error en limpieza manual:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error en la limpieza de sesión" 
+    });
+  }
+});
+
+// 🔥 Endpoint para limpieza AGRESIVA (elimina casi todo)
+app.post("/cleanup-session-aggressive", async (req, res) => {
+  try {
+    const { aggressiveCleanup } = require('./utils/cleanupSessionFiles');
+    await aggressiveCleanup();
+    res.json({ 
+      success: true, 
+      message: "Limpieza agresiva completada - pre-keys se regenerarán automáticamente" 
+    });
+  } catch (error) {
+    console.error("Error en limpieza agresiva:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error en la limpieza agresiva" 
+    });
+  }
+});
+
 let sock;
 let qrDinamic;
 let soket;
@@ -88,6 +131,13 @@ let soket;
 let messageStore = {};
 let contactStore = {};
 let chatStore = {};
+
+
+const ALLOWED_NUMBERS = [
+  "51950306310@s.whatsapp.net",
+  "5492236849095@s.whatsapp.net", 
+  "5492234214038@s.whatsapp.net"
+];
 
 // Función para crear el store de Baileys
 const initStore = () => {
@@ -151,33 +201,6 @@ const clearUserState = (jid) => {
   console.log(`🧹 Estado de ${jid} limpiado`);
 };
 
-
-
-const getMetodosPago = async () => {
-  try {
-    console.log("🔍 Intentando obtener métodos de pago de Supabase...");
-    
-    const { data, error } = await supabase
-      .from('metodos_pago')
-      .select('id, name')
-      .order('name');
-    
-    if (error) {
-      console.error("❌ Error en Supabase getMetodosPago:", error);
-      throw error;
-    }
-    
-    console.log(`✅ Métodos de pago obtenidos: ${data?.length || 0}`);
-    if (data?.length > 0) {
-      console.log("📋 Métodos de pago:", data.map(m => `${m.id}: ${m.name}`).join(', '));
-    }
-    
-    return data || [];
-  } catch (error) {
-    console.error('❌ Error obteniendo métodos de pago:', error.message);
-    return [];
-  }
-};
 
 // 📨 FUNCIONES PARA MENSAJES (botones eliminados, solo texto ahora)
 // Función para limpiar sesiones corruptas
@@ -277,6 +300,18 @@ async function connectToWhatsApp() {
     getMessage: async (key) => {
       // No intentar recuperar mensajes que causan errores MAC
       return undefined;
+    },
+    // 🧹 CONFIGURACIONES PARA REDUCIR ALMACENAMIENTO DE SESIONES
+    shouldIgnoreJid: (jid) => {
+      // Ignorar grupos y números no permitidos en el nivel de sesión
+      if (jid.includes('@g.us')) {
+        return true; // Ignorar todos los grupos
+      }
+      return !ALLOWED_NUMBERS.includes(jid);
+    },
+    // Reducir caché de contactos
+    shouldCacheContact: (jid) => {
+      return ALLOWED_NUMBERS.includes(jid);
     }
   });
 
@@ -302,18 +337,27 @@ async function connectToWhatsApp() {
   };
 
   // 🛡️ AGREGAR MANEJO DE ERRORES GLOBAL PARA EL SOCKET
-  sock.ev.on('error', (error) => {
-    if (error.message?.includes("Bad MAC")) {
-      // No hacer nada, estos errores son comunes durante la sincronización
+  sock.ev.on('error', async (error) => {
+    // Filtrar errores MAC normales durante sincronización
+    if (error.message?.includes("Bad MAC") || 
+        error.message?.includes("Failed to decrypt")) {
+      // Solo log cada 30 segundos para evitar spam
+      if (!global.lastSocketErrorLog || Date.now() - global.lastSocketErrorLog > 30000) {
+        console.log("⚠️ Errores de descifrado en socket (normal durante sincronización)");
+        global.lastSocketErrorLog = Date.now();
+      }
       return;
     }
-    console.error("⚠️ Error en socket:", error.message);
-  });
-
-  // 🛡️ LISTENER PARA MANEJAR ERRORES GLOBALES DEL SOCKET
-  sock.ev.on('error', async (error) => {
-    console.log("🔍 Error capturado en socket:", error.message?.substring(0, 100));
     
+    // Filtrar errores de callback relacionados con protocolMessage
+    if (error.message?.includes('The "cb" argument must be of type function')) {
+      console.log("⏭️ Error de callback en socket (probablemente protocolMessage)");
+      return;
+    }
+    
+    console.error("⚠️ Error en socket:", error.message);
+    
+    // Verificar si necesita reconexión
     const needsReconnect = await handleSessionError(error);
     if (needsReconnect) {
       console.log("🔄 Error crítico detectado, programando reconexión...");
@@ -323,20 +367,7 @@ async function connectToWhatsApp() {
     }
   });
 
-  // 🛡️ LISTENER PARA MANEJAR ERRORES DE DESCIFRADO
-  sock.ev.on('CB:Msg,server', async (node) => {
-    try {
-      // Procesar mensaje normalmente
-    } catch (error) {
-      if (error.message?.includes("Bad MAC")) {
-        console.log("⚠️ Error MAC en mensaje - continuando...");
-        return; // Ignorar error y continuar
-      }
-      throw error; // Re-lanzar otros errores
-    }
-  });
-
-  // 📝 LISTENER PRINCIPAL - MENSAJES NUEVOS CON SISTEMA DE ESTADO PERSISTENTE
+  //  LISTENER PRINCIPAL - MENSAJES NUEVOS CON SISTEMA DE ESTADO PERSISTENTE
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
       
@@ -345,10 +376,25 @@ async function connectToWhatsApp() {
         if (!msg.message || !msg.key?.remoteJid) continue;
 
         const jid = msg.key.remoteJid;
+
+        if (!ALLOWED_NUMBERS.includes(jid)) {
+        console.log(`🚫 Mensaje ignorado de número no permitido: ${jid}`);
+        continue; // Saltar al siguiente mensaje
+      }
+
         const messageId = msg.key.id;
         const senderName = contactStore[jid]?.name || jid.split("@")[0];
         const timestamp = msg.messageTimestamp || Math.floor(Date.now() / 1000);
         const messageType = getContentType(msg.message);
+        
+        // 🚫 Filtrar mensajes de protocolo y otros tipos no relevantes
+        if (messageType === "protocolMessage" || 
+            messageType === "reactionMessage" || 
+            messageType === "senderKeyDistributionMessage") {
+          console.log(`⏭️ Ignorando mensaje de tipo: ${messageType}`);
+          continue;
+        }
+        
         console.log({messageType})
         console.log(`📩 Nuevo mensaje de ${senderName} (${jid})`);
 
@@ -397,6 +443,21 @@ async function connectToWhatsApp() {
             
             if (userState.state === STATES.AWAITING_SAVE_CONFIRMATION) {
               await handleSaveConfirmation(jid, textMessage, userState, msg);
+              continue;
+            }
+
+            if (userState.state === STATES.AWAITING_MEDIO_PAGO_CONFIRMATION) {
+              await handleMedioPagoConfirmation(jid, textMessage, userState, msg);
+              continue;
+            }
+            
+            if (userState.state === STATES.AWAITING_MEDIO_PAGO_SELECTION) {
+              await handleMedioPagoSelection(jid, textMessage, userState, msg);
+              continue;
+            }
+
+            if (userState.state === STATES.AWAITING_NEW_METODO_PAGO_NAME) {
+              await handleNewMetodoPagoName(jid, textMessage, userState, msg);
               continue;
             }
             
@@ -486,10 +547,19 @@ async function connectToWhatsApp() {
           }
         }
       } catch (err) {
+        // Filtrar errores conocidos que no afectan el funcionamiento
         if (err.message?.includes("Bad MAC")) {
           console.log(`⚠️ Bad MAC en mensaje ${msg.key?.id}`);
+        } else if (err.message?.includes('The "cb" argument must be of type function')) {
+          console.log(`⏭️ Error de callback en mensaje ${msg.key?.id} (probablemente protocolMessage)`);
+        } else if (err.message?.includes("protocolMessage")) {
+          console.log(`⏭️ Error relacionado con protocolMessage en ${msg.key?.id}`);
         } else {
-          console.error(`❌ Error general en mensaje:`, err.message);
+          console.error(`❌ Error procesando mensaje ${msg.key?.id}:`, err.message);
+          // Log adicional para debugging si es necesario
+          if (process.env.NODE_ENV === 'development') {
+            console.error('Stack completo:', err.stack);
+          }
         }
       }
     }
@@ -775,6 +845,142 @@ Responde únicamente con el JSON, sin texto adicional.
     }
   };
 
+  const handleMedioPagoSelection = async (jid, textMessage, userState, quotedMsg) => {
+  const option = parseInt(textMessage.trim());
+  console.log(`🔍 Opción de método de pago seleccionada: ${option}`);
+  
+  const allMetodosPago = userState.data.allMetodosPago;
+  const maxOption = allMetodosPago.length + 1; // +1 por la opción "crear nuevo"
+
+  if (isNaN(option) || option < 0 || option > maxOption) {
+    await sock.sendMessage(jid, { 
+      text: `⚠️ Por favor, escribe un número válido (0 a ${maxOption}).` 
+    });
+    return;
+  }
+
+  if (option === 0) {
+    // Cancelar
+    await sock.sendMessage(jid, { text: "❌ Operación cancelada." });
+    clearUserState(jid);
+    return;
+  }
+
+  if (option === 1) {
+    // Crear nuevo método de pago
+    await startNewMetodoPagoFlow(jid, userState.data.structuredData);
+    return;
+  }
+
+  // Método de pago seleccionado (índices 2 en adelante)
+  const selectedIndex = option - 2; // Convertir a índice del array (0-based)
+  if (selectedIndex >= 0 && selectedIndex < allMetodosPago.length) {
+    const selectedMetodoPago = allMetodosPago[selectedIndex];
+    console.log(`✅ Método de pago seleccionado: ${selectedMetodoPago.name}`);
+
+    await proceedToFinalConfirmationWithMetodoPago(jid, selectedMetodoPago.name, userState.data.structuredData);
+  } else {
+    await sock.sendMessage(jid, { text: "⚠️ Opción no válida. Intenta nuevamente." });
+  }
+};
+
+const startNewMetodoPagoFlow = async (jid, structuredData) => {
+  setUserState(jid, STATES.AWAITING_NEW_METODO_PAGO_NAME, {
+    structuredData,
+    originalData: structuredData
+  });
+
+  await sock.sendMessage(jid, {
+    text: "💳 Vamos a crear un nuevo método de pago.\n\nEscribe el nombre del nuevo método de pago:"
+  });
+};
+
+// 📝 Manejar nombre de nuevo método de pago
+const handleNewMetodoPagoName = async (jid, textMessage, userState, quotedMsg) => {
+  const nombreMetodoPago = textMessage.trim();
+  
+  if (!nombreMetodoPago) {
+    await sock.sendMessage(jid, { text: "⚠️ Por favor, ingresa un nombre válido." });
+    return;
+  }
+
+  // Guardar nuevo método de pago en la base de datos
+  const newMetodoPago = await saveNewMetodoPago(nombreMetodoPago);
+
+  if (!newMetodoPago) {
+    await sock.sendMessage(jid, { text: "❌ Error guardando el método de pago. Intenta más tarde." });
+    clearUserState(jid);
+    return;
+  }
+
+  await sock.sendMessage(jid, { 
+    text: `✅ Método de pago *${nombreMetodoPago}* creado exitosamente.` 
+  });
+
+  // Verificar si estamos en modo modificación
+  const isModification = userState.data.isModification || userState.data.finalStructuredData;
+  
+  if (isModification) {
+    // Actualizar método de pago en modificación
+    const updatedData = {
+      ...userState.data.finalStructuredData,
+      medio_pago: nombreMetodoPago
+    };
+    console.log('🔧 Nuevo método de pago creado en modificación:', nombreMetodoPago);
+    await proceedToFinalConfirmationFromModification(jid, updatedData);
+  } else {
+    // Flujo normal
+    await proceedToFinalConfirmationWithMetodoPago(jid, nombreMetodoPago, userState.data.structuredData);
+  }
+};
+
+// 💾 Guardar nuevo método de pago en Supabase
+const saveNewMetodoPago = async (name) => {
+  try {
+    console.log(`💾 Guardando nuevo método de pago: ${name}`);
+    
+    const { data, error } = await supabase
+      .from('metodos_pago')
+      .insert([{ name: name }])
+      .select()
+      .single();
+    
+    if (error) {
+      console.error("❌ Error guardando método de pago:", error);
+      return null;
+    }
+    
+    console.log("✅ Método de pago guardado:", data);
+    return data;
+  } catch (error) {
+    console.error('❌ Error en saveNewMetodoPago:', error.message);
+    return null;
+  }
+};
+
+  const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, structuredData) => {
+    const finalData = {
+      ...structuredData,
+      medio_pago: metodoPagoName
+    };
+
+    setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
+      finalStructuredData: finalData
+    });
+
+    await sock.sendMessage(jid, {
+      text: `📋 *Datos del comprobante:*\n\n` +
+      `👤 *Destinatario:* ${finalData.nombre}\n` +
+      `💰 *Monto:* $${finalData.monto || 'No especificado'}\n` +
+      `📅 *Fecha:* ${finalData.fecha || 'No especificada'}\n` +
+      `🕐 *Hora:* ${finalData.hora || 'No especificada'}\n` +
+      `📊 *Tipo:* ${finalData.tipo_movimiento || 'No especificado'}\n` +
+      `💳 *Método de pago:* ${finalData.medio_pago}\n\n` +
+      `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`
+    });
+  };
+
+
   // 🔄 Manejar selección de la lista completa de destinatarios
   const handleChoosingInListOrAddingNew = async (jid, textMessage, userState, quotedMsg) => {
     const option = parseInt(textMessage.trim());
@@ -862,7 +1068,7 @@ Responde únicamente con el JSON, sin texto adicional.
   };
 
   // 📝 Manejar nombre de nuevo destinatario
-  const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg) => {
+   const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg) => {
     const nombreCanonico = textMessage.trim();
     
     if (!nombreCanonico) {
@@ -904,6 +1110,62 @@ Responde únicamente con el JSON, sin texto adicional.
     });
   };
 
+   const handleMedioPagoConfirmation = async (jid, textMessage, userState, quotedMsg) => {
+    const option = parseInt(textMessage.trim());
+    
+    if (isNaN(option) || option < 1 || option > 3) {
+      await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
+      return;
+    }
+
+    switch (option) {
+      case 1: // Sí
+        await proceedToFinalConfirmationWithMetodoPago(jid, userState.data.metodoPagoMatch.name, userState.data.structuredData);
+        break;
+      case 2: // No
+        await showAllMetodosPagoList(jid, userState.data.structuredData);
+        break;
+      case 3: // Cancelar
+        await sock.sendMessage(jid, { text: "❌ Operación cancelada." });
+        clearUserState(jid);
+        break;
+    }
+  };
+
+  const showAllMetodosPagoList = async (jid, structuredData) => {
+  try {
+    const metodosPago = await getMetodosPago();
+
+    if (metodosPago.length === 0) {
+      await sock.sendMessage(jid, { text: "❌ No hay métodos de pago registrados en el sistema." });
+      clearUserState(jid);
+      return;
+    }
+
+    // Crear lista numerada empezando desde 2
+    let metodosList = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
+    metodosPago.forEach((metodo, index) => {
+      metodosList += `${index + 2}. ${metodo.name}\n`;
+    });
+
+    // Guardar estado con los métodos disponibles
+    setUserState(jid, STATES.AWAITING_MEDIO_PAGO_SELECTION, {
+      structuredData,
+      allMetodosPago: metodosPago,
+      originalData: structuredData
+    });
+
+    await sock.sendMessage(jid, {
+      text: `💳 *Lista completa de métodos de pago:*\n\n${metodosList}\nEscribe el número del método de pago que corresponde:`
+    });
+
+  } catch (error) {
+    console.error("Error en showAllMetodosPagoList:", error);
+    await sock.sendMessage(jid, { text: "❌ Error mostrando la lista de métodos de pago." });
+    clearUserState(jid);
+  }
+};
+
   // � Manejar selección numérica de categoría
   const handleCategoryNumberSelection = async (jid, textMessage, userState, quotedMsg) => {
     const categoryNumber = parseInt(textMessage.trim());
@@ -926,7 +1188,7 @@ Responde únicamente con el JSON, sin texto adicional.
   };
 
   // 🔢 Manejar selección numérica de subcategoría
-  const handleSubcategoryNumberSelection = async (jid, textMessage, userState, quotedMsg) => {
+   const handleSubcategoryNumberSelection = async (jid, textMessage, userState, quotedMsg) => {
     const subcategoryNumber = parseInt(textMessage.trim());
     
     if (isNaN(subcategoryNumber) || subcategoryNumber < 1) {
@@ -1004,42 +1266,49 @@ Responde únicamente con el JSON, sin texto adicional.
       console.log('🔧 Nuevo destinatario creado en modificación:', userData.newDestinatarioName);
       await proceedToFinalConfirmationFromModification(jid, updatedData);
     } else {
-      // Flujo normal - crear nueva entrada
+      // Flujo normal - verificar método de pago después de crear nuevo destinatario
       await proceedToFinalConfirmation(jid, userData.newDestinatarioName, userData.structuredData);
     }
   };
 
   // ✅ Proceder a confirmación final
   const proceedToFinalConfirmation = async (jid, destinatarioName, structuredData) => {
-    const finalData = {
+    const dataWithDestinatario = {
       ...structuredData,
       nombre: destinatarioName
     };
 
-    setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
-      finalStructuredData: finalData
-    });
+    console.log(`🔍 Verificando método de pago: "${dataWithDestinatario.medio_pago}"`);
+    
+    // Buscar coincidencia de método de pago
+    const metodoPagoMatch = await matchMetodoPago(dataWithDestinatario.medio_pago);
+    
+    if (metodoPagoMatch.name) {
+      console.log("✅ Método de pago encontrado:", { metodoPagoMatch });
+      
+      // Guardar estado y datos
+      setUserState(jid, STATES.AWAITING_MEDIO_PAGO_CONFIRMATION, {
+        structuredData: dataWithDestinatario,
+        metodoPagoMatch,
+        originalData: dataWithDestinatario
+      });
 
-    await sock.sendMessage(jid, {
-      text: `📋 *Datos del comprobante:*\n\n` +
-      `👤 *Destinatario:* ${destinatarioName}\n` +
-      `💰 *Monto:* $${finalData.monto || 'No especificado'}\n` +
-      `📅 *Fecha:* ${finalData.fecha || 'No especificada'}\n` +
-      `🕐 *Hora:* ${finalData.hora || 'No especificada'}\n` +
-      `📊 *Tipo:* ${finalData.tipo_movimiento || 'No especificado'}\n` +
-      `💳 *Medio de pago:* ${finalData.medio_pago || 'No especificado'}\n\n` +
-      `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`
-    });
+      // Enviar pregunta de confirmación
+      await sock.sendMessage(jid, {
+        text: `💳 El método de pago es *${metodoPagoMatch.name}*\n\n¿Es correcto?\n\n1. Sí\n2. No\n3. Cancelar\n\nEscribe el número de tu opción:`
+      });
+
+    } else {
+      console.log("❌ No se encontró método de pago, mostrando lista completa...");
+      // No se encontró coincidencia, mostrar lista completa
+      await showAllMetodosPagoList(jid, dataWithDestinatario);
+    }
   };
 
   // 💾 Guardar comprobante final
   const saveComprobante = async (jid, userData) => {
     try {
-      // Aquí llamarías a tu función de guardado existente
-      console.log({userData})
       const result = await saveDataFirstFlow(userData.finalStructuredData);
-
-      console.log({result})
       if (result.success) {
         await sock.sendMessage(jid, { 
           text: "✅ Comprobante guardado exitosamente." 
@@ -1161,35 +1430,35 @@ Responde únicamente con el JSON, sin texto adicional.
 
   // 💳 Mostrar métodos de pago para modificación
   const showMediosPagoForModification = async (jid, userData) => {
-    try {
-      const metodosPago = await getMetodosPago();
-      
-      if (metodosPago.length === 0) {
-        await sock.sendMessage(jid, { text: "❌ No se pudieron cargar los métodos de pago." });
-        await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
-        return;
-      }
-
-      let metodosList = "0. ❌ Cancelar\n";
-      metodosPago.forEach((metodo, index) => {
-        metodosList += `${index + 1}. ${metodo.name}\n`;
-      });
-
-      setUserState(jid, STATES.AWAITING_MEDIO_PAGO_MODIFICATION, {
-        ...userData,
-        availableMetodosPago: metodosPago
-      });
-
-      await sock.sendMessage(jid, {
-        text: `💳 *Selecciona el nuevo método de pago:*\n\n${metodosList}\nEscribe el número del método de pago:`
-      });
-
-    } catch (error) {
-      console.error("Error en showMediosPagoForModification:", error);
-      await sock.sendMessage(jid, { text: "❌ Error mostrando métodos de pago." });
+  try {
+    const metodosPago = await getMetodosPago();
+    
+    if (metodosPago.length === 0) {
+      await sock.sendMessage(jid, { text: "❌ No se pudieron cargar los métodos de pago." });
       await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
+      return;
     }
-  };
+
+    let metodosList = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
+    metodosPago.forEach((metodo, index) => {
+      metodosList += `${index + 2}. ${metodo.name}\n`;
+    });
+
+    setUserState(jid, STATES.AWAITING_MEDIO_PAGO_MODIFICATION, {
+      ...userData,
+      availableMetodosPago: metodosPago
+    });
+
+    await sock.sendMessage(jid, {
+      text: `💳 *Selecciona el nuevo método de pago:*\n\n${metodosList}\nEscribe el número del método de pago:`
+    });
+
+  } catch (error) {
+    console.error("Error en showMediosPagoForModification:", error);
+    await sock.sendMessage(jid, { text: "❌ Error mostrando métodos de pago." });
+    await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
+  }
+};
 
   // 💰 Manejar modificación de monto
   const handleMontoModification = async (jid, textMessage, userState, quotedMsg) => {
@@ -1269,33 +1538,50 @@ Responde únicamente con el JSON, sin texto adicional.
   };
 
   // 💳 Manejar modificación de método de pago
-  const handleMedioPagoModification = async (jid, textMessage, userState, quotedMsg) => {
-    const option = parseInt(textMessage.trim());
-    
-    if (option === 0) {
-      await proceedToFinalConfirmationFromModification(jid, userState.data.finalStructuredData);
-      return;
-    }
+ const handleMedioPagoModification = async (jid, textMessage, userState, quotedMsg) => {
+  const option = parseInt(textMessage.trim());
+  
+  if (option === 0) {
+    await proceedToFinalConfirmationFromModification(jid, userState.data.finalStructuredData);
+    return;
+  }
 
-    const metodosPago = userState.data.availableMetodosPago;
-    if (isNaN(option) || option < 1 || option > metodosPago.length) {
-      await sock.sendMessage(jid, { 
-        text: `⚠️ Por favor, escribe un número válido (0 a ${metodosPago.length}).` 
-      });
-      return;
-    }
+  const metodosPago = userState.data.availableMetodosPago;
+  const maxOption = metodosPago.length + 1; // +1 por la opción "crear nuevo"
 
-    const selectedMetodo = metodosPago[option - 1];
-    
-    // Actualizar método de pago en los datos
-    const updatedData = {
-      ...userState.data.finalStructuredData,
-      medio_pago: selectedMetodo.name
-    };
+  if (isNaN(option) || option < 1 || option > maxOption) {
+    await sock.sendMessage(jid, { 
+      text: `⚠️ Por favor, escribe un número válido (0 a ${maxOption}).` 
+    });
+    return;
+  }
 
-    await sock.sendMessage(jid, { text: `✅ Método de pago actualizado a: ${selectedMetodo.name}` });
-    await proceedToFinalConfirmationFromModification(jid, updatedData);
+  if (option === 1) {
+    // Crear nuevo método de pago en modificación
+    setUserState(jid, STATES.AWAITING_NEW_METODO_PAGO_NAME, {
+      structuredData: null,
+      finalStructuredData: userState.data.finalStructuredData,
+      isModification: true,
+      originalData: userState.data.finalStructuredData
+    });
+
+    await sock.sendMessage(jid, {
+      text: "💳 Vamos a crear un nuevo método de pago.\n\nEscribe el nombre del nuevo método de pago:"
+    });
+    return;
+  }
+
+  const selectedMetodo = metodosPago[option - 2]; // -2 porque empezamos desde índice 2
+  
+  // Actualizar método de pago en los datos
+  const updatedData = {
+    ...userState.data.finalStructuredData,
+    medio_pago: selectedMetodo.name
   };
+
+  await sock.sendMessage(jid, { text: `✅ Método de pago actualizado a: ${selectedMetodo.name}` });
+  await proceedToFinalConfirmationFromModification(jid, updatedData);
+};
 
   // ✅ Volver a confirmación final desde modificación
   const proceedToFinalConfirmationFromModification = async (jid, finalData) => {
@@ -1371,84 +1657,30 @@ Responde únicamente con el JSON, sin texto adicional.
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on(
-    "messaging-history.set",
-    async ({ chats, contacts, messages, syncType }) => {
-      console.log("syncType:", syncType);
-      console.log(`Chats ${chats.length}, msgs ${messages.length}`);
-      await fs.writeFile(
-        "history.json",
-        JSON.stringify({ chats, contacts, messages }, null, 2)
-      );
-      for (const m of messages) {
-        console.log(
-          `msg ${m.key.id} from ${m.key.remoteJid}`,
-          m.message?.imageMessage ? "📷" : ""
-        );
-        if (m.message?.imageMessage) {
-          const buf = await downloadMediaMessage(m, "buffer");
-          await fs.writeFile(`img-${m.key.id}.jpg`, buf);
-        }
-      }
-    }
-  );
+  // sock.ev.on(
+  //   "messaging-history.set",
+  //   async ({ chats, contacts, messages, syncType }) => {
+  //     console.log("syncType:", syncType);
+  //     console.log(`Chats ${chats.length}, msgs ${messages.length}`);
+  //     await fs.promises.writeFile(
+  //       "history.json",
+  //       JSON.stringify({ chats, contacts, messages }, null, 2)
+  //     );
+  //     for (const m of messages) {
+  //       console.log(
+  //         `msg ${m.key.id} from ${m.key.remoteJid}`,
+  //         m.message?.imageMessage ? "📷" : ""
+  //       );
+  //       if (m.message?.imageMessage) {
+  //         const buf = await downloadMediaMessage(m, "buffer");
+  //         await fs.promises.writeFile(`img-${m.key.id}.jpg`, buf);
+  //       }
+  //     }
+  //   }
+  // );
 }
 
-// 🖼️ FUNCIÓN PARA DESCARGAR IMAGEN DE MENSAJE
-async function downloadImageMessage(message, senderName, messageId) {
-  try {
-    const buffer = await downloadMediaMessage(
-      message,
-      "buffer",
-      {},
-      {
-        logger: console,
-        reuploadRequest: sock.updateMediaMessage,
-      }
-    );
 
-    if (buffer) {
-      // Obtener el JID del remitente para crear carpeta específica
-      const senderJid = message.key.remoteJid || senderName;
-      const sanitizedJid = senderJid.replace(/[@.:]/g, "_");
-
-      // Crear directorio de descargas organizado por usuario
-      const downloadsDir = path.join(__dirname, "downloads");
-      const userDownloadsDir = path.join(downloadsDir, sanitizedJid);
-      await fs.promises.mkdir(userDownloadsDir, { recursive: true });
-
-      // Obtener información del archivo
-      const timestamp =
-        message.messageTimestamp || Math.floor(Date.now() / 1000);
-      const mimetype = message.message.imageMessage.mimetype || "image/jpeg";
-
-      let extension = ".jpg";
-      if (mimetype.includes("png")) extension = ".png";
-      else if (mimetype.includes("gif")) extension = ".gif";
-      else if (mimetype.includes("webp")) extension = ".webp";
-
-      // Crear nombre de archivo único (más simple ya que está en carpeta específica)
-      const fileName = `${timestamp}_${messageId}${extension}`;
-      const filePath = path.join(userDownloadsDir, fileName);
-
-      // Guardar archivo
-      await fs.promises.writeFile(filePath, buffer);
-
-      console.log(`📸 Imagen guardada: ${sanitizedJid}/${fileName}`);
-
-      const trueFilePath = `../downloads/${sanitizedJid}/${fileName}`;
-
-      return trueFilePath; // Retornar ruta completa para el log
-    }
-
-    return null;
-  } catch (error) {
-    console.error(`Error descargando imagen ${messageId}:`, error.message);
-    return null;
-  }
-}
-
-// � FUNCIÓN PARA DESCARGAR DOCUMENTO DE MENSAJE
 async function downloadDocumentMessage(message, senderName, messageId) {
   try {
     const buffer = await downloadMediaMessage(
@@ -1512,6 +1744,61 @@ async function downloadDocumentMessage(message, senderName, messageId) {
     return null;
   } catch (error) {
     console.error(`Error descargando documento ${messageId}:`, error.message);
+    return null;
+  }
+}
+
+
+// 🖼️ FUNCIÓN PARA DESCARGAR IMAGEN DE MENSAJE
+async function downloadImageMessage(message, senderName, messageId) {
+  try {
+    const buffer = await downloadMediaMessage(
+      message,
+      "buffer",
+      {},
+      {
+        logger: console,
+        reuploadRequest: sock.updateMediaMessage,
+      }
+    );
+
+    if (buffer) {
+      // Obtener el JID del remitente para crear carpeta específica
+      const senderJid = message.key.remoteJid || senderName;
+      const sanitizedJid = senderJid.replace(/[@.:]/g, "_");
+
+      // Obtener información del archivo
+      const timestamp = message.messageTimestamp || Math.floor(Date.now() / 1000);
+      const mimetype = message.message.imageMessage.mimetype || "image/jpeg";
+
+      let extension = ".jpg";
+      if (mimetype.includes("png")) extension = ".png";
+      else if (mimetype.includes("jpeg")) extension = ".jpeg";
+      else if (mimetype.includes("webp")) extension = ".webp";
+
+      // Crear nombre de archivo único
+      const fileName = `${timestamp}_${messageId}${extension}`;
+
+      // Subir a Supabase Storage
+      const uploadResult = await uploadFileToSupabase(
+        buffer, 
+        fileName, 
+        'whatsapp-images-2', 
+        sanitizedJid
+      );
+
+      if (uploadResult.success) {
+        console.log(`📸 Imagen subida a Supabase: ${uploadResult.url}`);
+        return uploadResult.url; // Retornar URL de Supabase
+      } else {
+        console.error(`❌ Error subiendo imagen: ${uploadResult.error}`);
+        return null;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error(`Error procesando imagen ${messageId}:`, error.message);
     return null;
   }
 }
@@ -1689,62 +1976,104 @@ try {
   console.log("💡 Verifica que el archivo de credenciales existe y es válido.");
 }
 
-const extractTextFromImage = async (imagePath) => {
+const extractTextFromImage = async (imageUrl) => {
   try {
     if (!visionClient) {
       console.log("⚠️ Google Vision no disponible - retornando texto vacío");
-      console.log("💡 Configura GOOGLE_APPLICATION_CREDENTIALS en tu archivo .env");
       return "";
     }
 
-    let correctedImagePath = imagePath;
-
-     if (imagePath.startsWith('../')) {
-      // 2. Reemplaza "../" por "./"
-      //    substring(3) obtiene la cadena a partir del tercer carácter,
-      //    eliminando los primeros tres caracteres ("../").
-      //    Luego, le añadimos "./" al principio.
-      correctedImagePath = `./${imagePath.substring(3)}`;
-      console.log(`🔧 Ruta de imagen corregida: '${imagePath}' -> '${correctedImagePath}'`);
+    // Verificar si es URL de Supabase (pública)
+    if (imageUrl.includes('supabase')) {
+      console.log(`🔍 Analizando imagen directamente desde Supabase: ${imageUrl}`);
+      
+      // Usar la URL directamente con Google Vision
+      const [result] = await visionClient.textDetection(imageUrl);
+      const detections = result.textAnnotations;
+      
+      if (detections && detections.length > 0) {
+        const fullText = detections[0].description || "";
+        console.log(`📄 Texto detectado desde URL (${fullText.length} caracteres):`, fullText.substring(0, 200) + "...");
+        return fullText;
+      } else {
+        console.log("📄 No se detectó texto en la imagen");
+        return "";
+      }
     } else {
-      // Si no empieza con '../', asumimos que ya está bien o es una ruta absoluta.
-      console.log(`📸 Usando ruta de imagen tal cual: '${correctedImagePath}'`);
-    }
-    // Verificar que el archivo existe
-    if (!fs.existsSync(correctedImagePath)) {
-      console.error(`❌ Archivo de imagen no encontrado: ${correctedImagePath}`);
-      return "";
-    }
+      // Retrocompatibilidad para rutas locales
+      const tempFilePath = imageUrl.startsWith('../') ? `./${imageUrl.substring(3)}` : imageUrl;
+      
+      if (!fs.existsSync(tempFilePath)) {
+        console.error(`❌ Archivo de imagen no encontrado: ${tempFilePath}`);
+        return "";
+      }
 
-    console.log(`🔍 Analizando imagen con Google Vision: ${correctedImagePath}`);
-    const [result] = await visionClient.textDetection(correctedImagePath);
-    const detections = result.textAnnotations;
-    
-    if (detections && detections.length > 0) {
-      const fullText = detections[0].description || "";
-      console.log(`📄 Texto detectado (${fullText.length} caracteres):`, fullText.substring(0, 200) + "...");
-      return fullText;
-    } else {
-      console.log("📄 No se detectó texto en la imagen");
-      return "";
+      console.log(`🔍 Analizando imagen local: ${tempFilePath}`);
+      const [result] = await visionClient.textDetection(tempFilePath);
+      const detections = result.textAnnotations;
+      
+      if (detections && detections.length > 0) {
+        const fullText = detections[0].description || "";
+        console.log(`📄 Texto detectado (${fullText.length} caracteres):`, fullText.substring(0, 200) + "...");
+        return fullText;
+      } else {
+        console.log("📄 No se detectó texto en la imagen");
+        return "";
+      }
     }
   } catch (err) {
     console.error("❌ Error en Vision OCR:", err.message);
     
-    // Proporcionar sugerencias específicas según el tipo de error
-    if (err.message.includes("authentication")) {
-      console.log("💡 Error de autenticación - verifica tu archivo de credenciales");
-    } else if (err.message.includes("quota")) {
-      console.log("💡 Error de cuota - verifica los límites de tu proyecto Google Cloud");
-    } else if (err.message.includes("API")) {
-      console.log("💡 Error de API - verifica que Vision API esté habilitada en Google Cloud");
+    // Si falla con URL, podrías implementar fallback a descarga temporal
+    if (imageUrl.includes('supabase')) {
+      console.log("⚠️ Falló análisis directo de URL, intentando descarga temporal...");
+      return await extractTextFromImageFallback(imageUrl);
     }
     
     return "";
   }
 };
 
-// 📄 FUNCIÓN PARA EXTRAER TEXTO DE DOCUMENTOS (PDFs, etc.)
+const extractTextFromImageFallback = async (imageUrl) => {
+  let tempFilePath = null;
+  
+  try {
+    console.log("🔄 Usando método de fallback para análisis de imagen");
+    
+    // Extraer bucket y path de la URL
+    const urlParts = imageUrl.split('/');
+    const bucket = 'whatsapp-images-2';
+    const pathIndex = urlParts.findIndex(part => part === bucket) + 1;
+    const filePath = urlParts.slice(pathIndex).join('/');
+    
+    tempFilePath = await downloadFileFromSupabase(bucket, filePath);
+    if (!tempFilePath) {
+      console.error(`❌ No se pudo descargar imagen desde Supabase`);
+      return "";
+    }
+
+    console.log(`🔍 Analizando imagen temporal: ${tempFilePath}`);
+    const [result] = await visionClient.textDetection(tempFilePath);
+    const detections = result.textAnnotations;
+    
+    if (detections && detections.length > 0) {
+      const fullText = detections[0].description || "";
+      console.log(`📄 Texto detectado con fallback (${fullText.length} caracteres)`);
+      return fullText;
+    }
+    
+    return "";
+  } catch (err) {
+    console.error("❌ Error en fallback OCR:", err.message);
+    return "";
+  } finally {
+    if (tempFilePath) {
+      await cleanupTempFile(tempFilePath);
+    }
+  }
+};
+
+
 const extractTextFromDocument = async (documentPath, fileName) => {
   try {
     console.log(`📄 Intentando extraer texto de documento: ${fileName}`);
@@ -1945,7 +2274,7 @@ const downloadAllImagesFromChat = async (jid, maxImages = 50) => {
             fs.mkdirSync(path.join(__dirname, "downloads"));
           }
 
-          fs.writeFileSync(filePath, buffer);
+          await fs.promises.writeFile(filePath, buffer);
 
           downloadedImages.push({
             messageId: msg.key.id,
@@ -2008,784 +2337,6 @@ const getMyJid = () => {
   return myNumber;
 };
 
-app.get("/send-message", async (req, res) => {
-  const tempMessage = req.query.message;
-  const number = req.query.number;
-
-  let numberWA;
-  try {
-    if (!number) {
-      res.status(500).json({
-        status: false,
-        response: "El numero no existe",
-      });
-    } else {
-      numberWA = "591" + number + "@s.whatsapp.net";
-
-      if (isConnected()) {
-        const exist = await sock.onWhatsApp(numberWA);
-
-        if (exist?.jid || (exist && exist[0]?.jid)) {
-          sock
-            .sendMessage(exist.jid || exist[0].jid, {
-              text: tempMessage,
-            })
-            .then((result) => {
-              res.status(200).json({
-                status: true,
-                response: result,
-              });
-            })
-            .catch((err) => {
-              res.status(500).json({
-                status: false,
-                response: err,
-              });
-            });
-        }
-      } else {
-        res.status(500).json({
-          status: false,
-          response: "Aun no estas conectado",
-        });
-      }
-    }
-  } catch (err) {
-    res.status(500).send(err);
-  }
-});
-
-// 📄 ENDPOINT PARA VER EL LOG DE MENSAJES POR CHAT
-app.get("/messages-log", async (req, res) => {
-  try {
-    const logsDir = path.join(__dirname, "chat-logs");
-    const { jid, type, sender, limit } = req.query;
-
-    // Si se especifica un JID, devolver solo ese chat
-    if (jid) {
-      const sanitizedJid = jid.replace(/[@.:]/g, "_");
-      const logPath = path.join(logsDir, `${sanitizedJid}.json`);
-
-      if (!fs.existsSync(logPath)) {
-        return res.status(200).json({
-          status: true,
-          messages: [],
-          count: 0,
-          jid: jid,
-          message: "No hay mensajes en el log de este chat todavía",
-        });
-      }
-
-      const logData = await fs.promises.readFile(logPath, "utf8");
-      let messages = JSON.parse(logData);
-
-      // Aplicar filtros
-      if (type) {
-        messages = messages.filter((msg) => msg.type === type);
-      }
-
-      if (limit) {
-        messages = messages.slice(-parseInt(limit));
-      }
-
-      return res.status(200).json({
-        status: true,
-        messages: messages.reverse(), // Más recientes primero
-        count: messages.length,
-        jid: jid,
-        chatName: messages[0]?.senderName || jid.split("@")[0],
-      });
-    }
-
-    // Si no se especifica JID, devolver resumen de todos los chats
-    if (!fs.existsSync(logsDir)) {
-      return res.status(200).json({
-        status: true,
-        chats: [],
-        totalChats: 0,
-        message: "No hay logs de chats todavía",
-      });
-    }
-
-    const logFiles = fs
-      .readdirSync(logsDir)
-      .filter((file) => file.endsWith(".json"));
-    let allChats = [];
-
-    for (const file of logFiles) {
-      try {
-        const logPath = path.join(logsDir, file);
-        const logData = await fs.promises.readFile(logPath, "utf8");
-        const messages = JSON.parse(logData);
-
-        if (messages.length > 0) {
-          const lastMessage = messages[messages.length - 1];
-          const firstMessage = messages[0];
-
-          // Aplicar filtro de sender si se especifica
-          let filteredMessages = messages;
-          if (sender) {
-            filteredMessages = messages.filter(
-              (msg) =>
-                msg.senderName.toLowerCase().includes(sender.toLowerCase()) ||
-                msg.sender.includes(sender)
-            );
-          }
-
-          if (filteredMessages.length > 0) {
-            allChats.push({
-              jid: firstMessage.sender,
-              chatName: firstMessage.senderName,
-              fileName: file,
-              totalMessages: messages.length,
-              filteredMessages: filteredMessages.length,
-              lastMessage: {
-                content: lastMessage.content,
-                type: lastMessage.type,
-                date: lastMessage.date,
-              },
-              stats: {
-                texto: messages.filter((m) => m.type === "texto").length,
-                imagen: messages.filter((m) => m.type === "imagen").length,
-                hibrido: messages.filter((m) => m.type === "hibrido").length,
-                video: messages.filter((m) => m.type === "video").length,
-                otro: messages.filter((m) => m.type === "otro").length,
-              },
-            });
-          }
-        }
-      } catch (error) {
-        console.error(`Error procesando archivo ${file}:`, error.message);
-      }
-    }
-
-    // Ordenar chats por último mensaje (más reciente primero)
-    allChats.sort(
-      (a, b) => new Date(b.lastMessage.date) - new Date(a.lastMessage.date)
-    );
-
-    // Aplicar límite si se especifica
-    if (limit) {
-      allChats = allChats.slice(0, parseInt(limit));
-    }
-
-    res.status(200).json({
-      status: true,
-      chats: allChats,
-      totalChats: logFiles.length,
-      filters: { type, sender, limit },
-      message: `Para ver mensajes de un chat específico, usa: ?jid=NUMERO@s.whatsapp.net`,
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// 🧹 ENDPOINT PARA LIMPIAR LOG DE MENSAJES
-app.delete("/messages-log", async (req, res) => {
-  try {
-    const logPath = path.join(__dirname, "messages_log.json");
-
-    if (fs.existsSync(logPath)) {
-      await fs.promises.unlink(logPath);
-    }
-
-    res.status(200).json({
-      status: true,
-      response: "Log de mensajes eliminado correctamente",
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// 📊 ENDPOINT PARA ESTADÍSTICAS DE MENSAJES POR CHAT
-app.get("/messages-stats", async (req, res) => {
-  try {
-    const logsDir = path.join(__dirname, "chat-logs");
-
-    if (!fs.existsSync(logsDir)) {
-      return res.status(200).json({
-        status: true,
-        stats: {
-          totalChats: 0,
-          totalMessages: 0,
-          messageTypes: {},
-          topChats: [],
-        },
-        message: "No hay logs de chats todavía",
-      });
-    }
-
-    const logFiles = fs
-      .readdirSync(logsDir)
-      .filter((file) => file.endsWith(".json"));
-    let totalMessages = 0;
-    let messageTypes = { texto: 0, imagen: 0, hibrido: 0, video: 0, otro: 0 };
-    let chatStats = [];
-
-    for (const file of logFiles) {
-      try {
-        const logPath = path.join(logsDir, file);
-        const logData = await fs.promises.readFile(logPath, "utf8");
-        const messages = JSON.parse(logData);
-
-        if (messages.length > 0) {
-          totalMessages += messages.length;
-
-          // Contar tipos de mensajes para este chat
-          const chatTypes = {
-            texto: 0,
-            imagen: 0,
-            hibrido: 0,
-            video: 0,
-            otro: 0,
-          };
-          messages.forEach((msg) => {
-            if (messageTypes.hasOwnProperty(msg.type)) {
-              messageTypes[msg.type]++;
-              chatTypes[msg.type]++;
-            } else {
-              messageTypes.otro++;
-              chatTypes.otro++;
-            }
-          });
-
-          const lastMessage = messages[messages.length - 1];
-          const firstMessage = messages[0];
-
-          chatStats.push({
-            jid: firstMessage.sender,
-            chatName: firstMessage.senderName,
-            fileName: file,
-            totalMessages: messages.length,
-            messageTypes: chatTypes,
-            lastActivity: lastMessage.date,
-            firstMessage: firstMessage.date,
-          });
-        }
-      } catch (error) {
-        console.error(
-          `Error procesando estadísticas del archivo ${file}:`,
-          error.message
-        );
-      }
-    }
-
-    // Ordenar chats por número de mensajes (más activos primero)
-    chatStats.sort((a, b) => b.totalMessages - a.totalMessages);
-
-    // Top 10 chats más activos
-    const topChats = chatStats.slice(0, 10);
-
-    // Estadísticas globales
-    const stats = {
-      totalChats: logFiles.length,
-      totalMessages: totalMessages,
-      promedioPorChat: Math.round(totalMessages / logFiles.length) || 0,
-      messageTypes: messageTypes,
-      topChats: topChats.map((chat) => ({
-        chatName: chat.chatName,
-        jid: chat.jid,
-        totalMessages: chat.totalMessages,
-        messageTypes: chat.messageTypes,
-        lastActivity: chat.lastActivity,
-      })),
-      ultimaActividad:
-        chatStats.length > 0
-          ? chatStats.sort(
-              (a, b) => new Date(b.lastActivity) - new Date(a.lastActivity)
-            )[0].lastActivity
-          : null,
-    };
-
-    res.status(200).json({
-      status: true,
-      stats: stats,
-      generatedAt: new Date().toISOString(),
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// Endpoint para obtener todos los chats
-app.get("/get-chats", async (req, res) => {
-  try {
-    if (!isConnected()) {
-      return res.status(500).json({
-        status: false,
-        response: "No estás conectado a WhatsApp",
-      });
-    }
-
-    const chats = getAllChats();
-    res.status(200).json({
-      status: true,
-      chats: chats,
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// Endpoint para obtener el historial de un chat específico
-app.get("/get-chat-history", async (req, res) => {
-  try {
-    const { jid, limit } = req.query;
-
-    if (!isConnected()) {
-      return res.status(500).json({
-        status: false,
-        response: "No estás conectado a WhatsApp",
-      });
-    }
-
-    if (!jid) {
-      return res.status(400).json({
-        status: false,
-        response: "Se requiere el parámetro 'jid' del chat",
-      });
-    }
-
-    const messages = await getChatHistory(jid, parseInt(limit) || 50);
-
-    res.status(200).json({
-      status: true,
-      jid: jid,
-      messages: messages,
-      count: messages.length,
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-
-// 🔧 ENDPOINTS BÁSICOS PARA ESTADO Y LIMPIEZA
-app.get("/session-health", async (req, res) => {
-  try {
-    const health = {
-      isConnected: isConnected(),
-      socketExists: !!sock,
-      userInfo: sock?.user || null,
-      sessionPath: path.join(__dirname, "session_auth_info"),
-      sessionExists: fs.existsSync(path.join(__dirname, "session_auth_info")),
-      memoryStats: {
-        messageChats: Object.keys(messageStore).length,
-        totalMessages: Object.values(messageStore).reduce(
-          (acc, msgs) => acc + msgs.length,
-          0
-        ),
-      },
-      macErrors: {
-        count: macErrorCount,
-        lastReset: new Date(lastMacErrorReset).toISOString(),
-        timeSinceReset: Math.floor((Date.now() - lastMacErrorReset) / 1000),
-        status: macErrorCount > 50 ? "⚠️ Alto" : macErrorCount > 20 ? "🟡 Medio" : "✅ Normal"
-      },
-      services: {
-        openAI: !!process.env.OPENAI_API_KEY ? "✅ Configurado" : "❌ No configurado",
-        googleVision: {
-          status: !!visionClient ? "✅ Configurado" : "❌ No configurado",
-          credentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS || "No configurado",
-          credentialsExist: process.env.GOOGLE_APPLICATION_CREDENTIALS ? 
-            fs.existsSync(process.env.GOOGLE_APPLICATION_CREDENTIALS) : false
-        }
-      }
-    };
-
-    res.status(200).json({
-      status: true,
-      health: health,
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// 🔄 ENDPOINT PARA VER ESTADOS ACTIVOS DE USUARIOS
-app.get("/user-states", async (req, res) => {
-  try {
-    const activeStates = Array.from(stateMap.entries()).map(([jid, stateData]) => ({
-      jid,
-      state: stateData.state,
-      timestamp: new Date(stateData.timestamp).toISOString(),
-      timeElapsed: Math.floor((Date.now() - stateData.timestamp) / 1000),
-      hasTimeout: !!stateData.timeout,
-      data: {
-        hasStructuredData: !!stateData.data.structuredData,
-        hasDestinatarioMatch: !!stateData.data.destinatarioMatch,
-        newDestinatarioName: stateData.data.newDestinatarioName || null,
-        selectedCategoriaId: stateData.data.selectedCategoriaId || null
-      }
-    }));
-
-    res.status(200).json({
-      status: true,
-      activeUsers: activeStates.length,
-      states: activeStates,
-      stateTypes: STATES
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// 🔧 ENDPOINT PARA PROBAR SUPABASE Y CATEGORÍAS
-app.get("/test-supabase", async (req, res) => {
-  try {
-    console.log("🧪 Probando conexión a Supabase...");
-    
-    // Probar conexión básica
-    const { data: healthCheck, error: healthError } = await supabase
-      .from('categorias')
-      .select('count', { count: 'exact', head: true });
-    
-    if (healthError) {
-      return res.status(500).json({
-        status: false,
-        error: "Error de conexión a Supabase",
-        details: healthError.message
-      });
-    }
-
-    // Obtener categorías
-    const categorias = await getCategorias();
-    
-    // Obtener subcategorías de la primera categoría si existe
-    let subcategorias = [];
-    if (categorias.length > 0) {
-      subcategorias = await getSubcategorias(categorias[0].id);
-    }
-
-    res.status(200).json({
-      status: true,
-      supabase: {
-        connected: true,
-        url: process.env.SUPABASE_URL ? "✅ Configurado" : "❌ No configurado",
-        key: process.env.SUPABASE_SERVICE_ROLE_KEY ? "✅ Configurado" : "❌ No configurado"
-      },
-      categorias: {
-        count: categorias.length,
-        data: categorias
-      },
-      subcategorias: {
-        count: subcategorias.length,
-        data: subcategorias,
-        forCategory: categorias[0]?.nombre || "N/A"
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// 🧹 ENDPOINT PARA LIMPIAR ESTADO DE UN USUARIO ESPECÍFICO
-app.delete("/user-state/:jid", async (req, res) => {
-  try {
-    const jid = req.params.jid;
-    
-    if (stateMap.has(jid)) {
-      clearUserState(jid);
-      res.status(200).json({
-        status: true,
-        response: `Estado del usuario ${jid} eliminado exitosamente`
-      });
-    } else {
-      res.status(404).json({
-        status: false,
-        response: `No se encontró estado activo para el usuario ${jid}`
-      });
-    }
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// 🧹 ENDPOINT PARA LIMPIAR TODOS LOS ESTADOS ACTIVOS
-app.delete("/user-states", async (req, res) => {
-  try {
-    const activeUsersCount = stateMap.size;
-    
-    // Limpiar todos los timeouts y estados
-    for (const [jid] of stateMap) {
-      clearUserState(jid);
-    }
-    
-    res.status(200).json({
-      status: true,
-      response: `Se eliminaron ${activeUsersCount} estados activos`,
-      clearedStates: activeUsersCount
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// 🧹 ENDPOINT PARA LIMPIAR SESIÓN CORRUPTA
-app.post("/clear-session", async (req, res) => {
-  try {
-    console.log("🧹 Solicitud de limpieza de sesión recibida...");
-
-    if (sock) {
-      sock.end();
-      sock = null;
-    }
-
-    await clearCorruptedSession();
-
-    messageStore = {};
-    contactStore = {};
-    chatStore = {};
-
-    // Reset contador de errores MAC
-    macErrorCount = 0;
-    lastMacErrorReset = Date.now();
-
-    res.status(200).json({
-      status: true,
-      response: "Sesión limpiada exitosamente. El bot se reconectará automáticamente.",
-      action: "Visita /scan si necesitas generar un nuevo QR",
-      macErrorsReset: true
-    });
-
-    // Reconectar después de 3 segundos
-    setTimeout(() => {
-      console.log("🔄 Reconectando después de limpieza...");
-      connectToWhatsApp().catch((err) =>
-        console.log("Error reconectando:", err.message)
-      );
-    }, 3000);
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// Endpoint para limpiar descargas automáticas
-app.delete("/clear-downloads", async (req, res) => {
-  try {
-    const downloadsDir = path.join(__dirname, "downloads");
-
-    if (fs.existsSync(downloadsDir)) {
-      const files = fs.readdirSync(downloadsDir);
-      let deletedCount = 0;
-
-      for (const file of files) {
-        if (file !== "download_log.json") {
-          fs.unlinkSync(path.join(downloadsDir, file));
-          deletedCount++;
-        }
-      }
-
-      // Limpiar también el log
-      const logPath = path.join(downloadsDir, "download_log.json");
-      if (fs.existsSync(logPath)) {
-        fs.unlinkSync(logPath);
-      }
-
-      res.status(200).json({
-        status: true,
-        response: `Se eliminaron ${deletedCount} archivos descargados automáticamente`,
-        deletedFiles: deletedCount,
-      });
-    } else {
-      res.status(200).json({
-        status: true,
-        response: "No hay directorio de descargas para limpiar",
-      });
-    }
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// 📁 ENDPOINT PARA VER ESTRUCTURA DE DESCARGAS ORGANIZADAS POR USUARIO
-app.get("/downloads-structure", async (req, res) => {
-  try {
-    const downloadsDir = path.join(__dirname, "downloads");
-    const { jid } = req.query;
-
-    if (!fs.existsSync(downloadsDir)) {
-      return res.status(200).json({
-        status: true,
-        structure: {},
-        totalUsers: 0,
-        totalFiles: 0,
-        message: "No hay directorio de descargas todavía",
-      });
-    }
-
-    // Si se especifica un JID, mostrar solo esa carpeta
-    if (jid) {
-      const sanitizedJid = jid.replace(/[@.:]/g, "_");
-      const userDir = path.join(downloadsDir, sanitizedJid);
-
-      if (!fs.existsSync(userDir)) {
-        return res.status(200).json({
-          status: true,
-          user: jid,
-          files: [],
-          totalFiles: 0,
-          message: "Este usuario no tiene archivos descargados",
-        });
-      }
-
-      const files = fs.readdirSync(userDir);
-      const fileDetails = [];
-
-      for (const file of files) {
-        const filePath = path.join(userDir, file);
-        const stats = fs.statSync(filePath);
-        const fileType = getFileType(file);
-
-        fileDetails.push({
-          name: file,
-          type: fileType,
-          size: formatFileSize(stats.size),
-          sizeBytes: stats.size,
-          created: stats.birthtime,
-          modified: stats.mtime,
-        });
-      }
-
-      // Ordenar por fecha de creación (más reciente primero)
-      fileDetails.sort((a, b) => new Date(b.created) - new Date(a.created));
-
-      return res.status(200).json({
-        status: true,
-        user: jid,
-        sanitizedJid: sanitizedJid,
-        files: fileDetails,
-        totalFiles: files.length,
-        stats: getFileTypeStats(fileDetails),
-      });
-    }
-
-    // Mostrar estructura completa
-    const userDirs = fs.readdirSync(downloadsDir).filter((item) => {
-      return fs.statSync(path.join(downloadsDir, item)).isDirectory();
-    });
-
-    const structure = {};
-    let totalFiles = 0;
-
-    for (const userDir of userDirs) {
-      const userPath = path.join(downloadsDir, userDir);
-      const files = fs.readdirSync(userPath);
-
-      const fileDetails = [];
-      for (const file of files) {
-        const filePath = path.join(userPath, file);
-        const stats = fs.statSync(filePath);
-        const fileType = getFileType(file);
-
-        fileDetails.push({
-          name: file,
-          type: fileType,
-          size: formatFileSize(stats.size),
-          sizeBytes: stats.size,
-          created: stats.birthtime,
-        });
-      }
-
-      // Ordenar por fecha de creación (más reciente primero)
-      fileDetails.sort((a, b) => new Date(b.created) - new Date(a.created));
-
-      totalFiles += files.length;
-      structure[userDir] = {
-        totalFiles: files.length,
-        files: fileDetails,
-        stats: getFileTypeStats(fileDetails),
-        lastActivity: fileDetails[0]?.created || null,
-      };
-    }
-
-    // Ordenar usuarios por última actividad
-    const sortedStructure = Object.fromEntries(
-      Object.entries(structure).sort(
-        ([, a], [, b]) =>
-          new Date(b.lastActivity || 0) - new Date(a.lastActivity || 0)
-      )
-    );
-
-    res.status(200).json({
-      status: true,
-      structure: sortedStructure,
-      totalUsers: userDirs.length,
-      totalFiles: totalFiles,
-      message:
-        "Para ver archivos de un usuario específico, usa: ?jid=NUMERO@s.whatsapp.net",
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: false,
-      response: error.message,
-    });
-  }
-});
-
-// Funciones auxiliares para el endpoint de descargas
-function getFileType(fileName) {
-  const ext = path.extname(fileName).toLowerCase();
-
-  if (
-    fileName.startsWith("img_") ||
-    [".jpg", ".jpeg", ".png", ".gif", ".webp"].includes(ext)
-  ) {
-    return "imagen";
-  } else if (
-    fileName.startsWith("vid_") ||
-    [".mp4", ".webm", ".avi", ".mov"].includes(ext)
-  ) {
-    return "video";
-  } else if (
-    fileName.startsWith("aud_") ||
-    [".ogg", ".mp3", ".wav", ".m4a"].includes(ext)
-  ) {
-    return "audio";
-  } else if (fileName.startsWith("doc_")) {
-    return "documento";
-  } else {
-    return "otro";
-  }
-}
 
 function formatFileSize(bytes) {
   if (bytes === 0) return "0 Bytes";
@@ -2797,146 +2348,6 @@ function formatFileSize(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 }
 
-function getFileTypeStats(files) {
-  const stats = { imagen: 0, video: 0, audio: 0, documento: 0, otro: 0 };
-  files.forEach((file) => {
-    stats[file.type] = (stats[file.type] || 0) + 1;
-  });
-  return stats;
-}
-
-
-
-
-// 🖼️ FUNCIÓN PARA DESCARGAR IMAGEN DE UN MENSAJE
-async function downloadImageFromMessage(message, contactName, messageId) {
-  try {
-    console.log(`📸 Descargando imagen ${messageId}...`);
-
-    const buffer = await downloadMediaMessage(
-      message,
-      "buffer",
-      {},
-      {
-        logger: console,
-        reuploadRequest: sock.updateMediaMessage,
-      }
-    );
-
-    if (buffer) {
-      const timestamp = message.messageTimestamp || Date.now();
-      const caption = message.message.imageMessage?.caption || "";
-      const mimetype = message.message.imageMessage?.mimetype || "image/jpeg";
-
-      let extension = ".jpg";
-      if (mimetype.includes("png")) extension = ".png";
-      else if (mimetype.includes("gif")) extension = ".gif";
-      else if (mimetype.includes("webp")) extension = ".webp";
-
-      const downloadDir = path.join(__dirname, "thiago-downloads");
-      await fs.promises.mkdir(downloadDir, { recursive: true });
-
-      const fileName = `thiago_${timestamp}_${messageId}${extension}`;
-      const filePath = path.join(downloadDir, fileName);
-
-      await fs.promises.writeFile(filePath, buffer);
-
-      // Log de descarga
-      const downloadLog = {
-        fileName: fileName,
-        filePath: filePath,
-        messageId: messageId,
-        caption: caption,
-        mimetype: mimetype,
-        fileSize: buffer.length,
-        downloadTime: new Date().toISOString(),
-      };
-
-      const logPath = path.join(downloadDir, "download_log.json");
-      let logs = [];
-
-      try {
-        const existingLogs = await fs.promises.readFile(logPath, "utf8");
-        logs = JSON.parse(existingLogs);
-      } catch (error) {
-        // Archivo no existe, empezar logs vacíos
-      }
-
-      logs.push(downloadLog);
-      await fs.promises.writeFile(logPath, JSON.stringify(logs, null, 2));
-
-      console.log(
-        `   ✅ ${fileName} descargado (${formatFileSize(buffer.length)})`
-      );
-      return { success: true, fileName: fileName, fileSize: buffer.length };
-    } else {
-      console.log(`   ❌ No se pudo descargar imagen ${messageId}`);
-      return { success: false, error: "Buffer vacío" };
-    }
-  } catch (error) {
-    console.error(
-      `   ❌ Error descargando imagen ${messageId}:`,
-      error.message
-    );
-    return { success: false, error: error.message };
-  }
-}
-
-// 🎥 FUNCIÓN PARA DESCARGAR VIDEO DE UN MENSAJE
-async function downloadVideoFromMessage(message, contactName, messageId) {
-  try {
-    console.log(`🎬 Descargando video ${messageId}...`);
-
-    const buffer = await downloadMediaMessage(
-      message,
-      "buffer",
-      {},
-      {
-        logger: console,
-        reuploadRequest: sock.updateMediaMessage,
-      }
-    );
-
-    if (buffer) {
-      const timestamp = message.messageTimestamp || Date.now();
-      const caption = message.message.videoMessage?.caption || "";
-      const mimetype = message.message.videoMessage?.mimetype || "video/mp4";
-
-      let extension = ".mp4";
-      if (mimetype.includes("avi")) extension = ".avi";
-      else if (mimetype.includes("mov")) extension = ".mov";
-      else if (mimetype.includes("webm")) extension = ".webm";
-
-      const downloadDir = path.join(__dirname, "thiago-downloads");
-      await fs.promises.mkdir(downloadDir, { recursive: true });
-
-      const fileName = `thiago_video_${timestamp}_${messageId}${extension}`;
-      const filePath = path.join(downloadDir, fileName);
-
-      await fs.promises.writeFile(filePath, buffer);
-
-      console.log(
-        `   ✅ ${fileName} descargado (${formatFileSize(buffer.length)})`
-      );
-      return { success: true, fileName: fileName, fileSize: buffer.length };
-    } else {
-      console.log(`   ❌ No se pudo descargar video ${messageId}`);
-      return { success: false, error: "Buffer vacío" };
-    }
-  } catch (error) {
-    console.error(`   ❌ Error descargando video ${messageId}:`, error.message);
-    return { success: false, error: error.message };
-  }
-}
-
-// 🔧 FUNCIÓN HELPER PARA FORMATEAR TAMAÑO DE ARCHIVO
-// function formatFileSize(bytes) {
-//   if (bytes === 0) return "0 Bytes";
-//   const k = 1024;
-//   const sizes = ["Bytes", "KB", "MB", "GB"];
-//   const i = Math.floor(Math.log(bytes) / Math.log(k));
-//   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
-// }
 
 io.on("connection", async (socket) => {
   soket = socket;
@@ -3030,15 +2441,30 @@ process.on('uncaughtException', (error) => {
 process.on('unhandledRejection', (reason, promise) => {
   const errorMessage = reason?.message || reason;
 
-  if (typeof errorMessage === 'string' && 
-      (errorMessage.includes("Bad MAC") || 
-       errorMessage.includes("Failed to decrypt") ||
-       errorMessage.includes("Session error"))) {
+  if (typeof errorMessage === 'string') {
+    // Filtrar errores de sesión normales durante sincronización
+    if (errorMessage.includes("Bad MAC") || 
+        errorMessage.includes("Failed to decrypt") ||
+        errorMessage.includes("Session error")) {
+      return;
+    }
     
-    return;
+    // Filtrar errores de callback relacionados con protocolMessage
+    if (errorMessage.includes('The "cb" argument must be of type function') ||
+        errorMessage.includes('callback') && errorMessage.includes('undefined')) {
+      // Solo mostrar un resumen cada 30 segundos para evitar spam
+      if (!global.lastCallbackErrorLog || Date.now() - global.lastCallbackErrorLog > 30000) {
+        console.log("⚠️ Errores de callback detectados (probablemente protocolMessage) - filtrados");
+        global.lastCallbackErrorLog = Date.now();
+      }
+      return;
+    }
   }
   
   console.error('❌ Promesa rechazada no manejada:', errorMessage);
 });
+
+// 🧹 Iniciar limpieza periódica de archivos de sesión
+startPeriodicCleanup();
 
 startApp();
