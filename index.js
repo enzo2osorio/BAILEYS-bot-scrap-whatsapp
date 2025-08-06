@@ -1954,26 +1954,41 @@ const isConnected = () => {
   return sock?.user ? true : false;
 };
 
-// 🔧 Cliente de Vision (usando detección automática de credenciales)
+// 🔧 Cliente de Vision (compatible con Render y variables de entorno JSON)
 let visionClient = null;
 try {
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    // Verificar que el archivo de credenciales exista en la ruta especificada
+  // 🌐 Manejo para Render: Crear archivo temporal desde JSON en variable de entorno
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+    console.log("🔧 Configurando credenciales de Google desde variable de entorno JSON...");
+    
+    // Crear archivo temporal con las credenciales
+    const tempCredPath = path.join(__dirname, 'gcloud-creds.json');
+    fs.writeFileSync(tempCredPath, process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+    
+    // Setear la ruta del archivo temporal para que Google Vision lo use
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = tempCredPath;
+    
+    visionClient = new vision.ImageAnnotatorClient();
+    console.log("✅ Google Vision cliente inicializado desde variable de entorno JSON (Render).");
+    
+  } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    // 📁 Manejo tradicional: archivo de credenciales local
     const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
     if (!fs.existsSync(credentialsPath)) {
       console.error(`❌ Archivo de credenciales no encontrado en: ${credentialsPath}`);
       console.log("⚠️ GOOGLE_APPLICATION_CREDENTIALS configurada, pero el archivo no existe.");
     } else {
       visionClient = new vision.ImageAnnotatorClient();
-      console.log("✅ Google Vision cliente inicializado con credenciales automáticas.");
+      console.log("✅ Google Vision cliente inicializado con credenciales de archivo local.");
     }
   } else {
-    console.log("⚠️ GOOGLE_APPLICATION_CREDENTIALS no configurada - OCR deshabilitado.");
-    console.log("💡 Configura la variable de entorno apuntando a tu archivo JSON de credenciales.");
+    console.log("⚠️ Credenciales de Google no configuradas - OCR deshabilitado.");
+    console.log("💡 Para Render: Configura GOOGLE_APPLICATION_CREDENTIALS_JSON con el contenido del JSON");
+    console.log("💡 Para local: Configura GOOGLE_APPLICATION_CREDENTIALS con la ruta al archivo JSON");
   }
 } catch (error) {
   console.warn("⚠️ Error inicializando Google Vision:", error.message);
-  console.log("💡 Verifica que el archivo de credenciales existe y es válido.");
+  console.log("💡 Verifica que las credenciales de Google Cloud están configuradas correctamente.");
 }
 
 const extractTextFromImage = async (imageUrl) => {
@@ -2395,8 +2410,9 @@ const startApp = async () => {
       console.warn("⚠️ OPENAI_API_KEY no configurada - IA deshabilitada");
     }
     
-    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-      console.warn("⚠️ GOOGLE_APPLICATION_CREDENTIALS no configurada - OCR deshabilitado");
+    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON && !process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      console.warn("⚠️ Credenciales de Google no configuradas - OCR deshabilitado");
+      console.warn("💡 Configura GOOGLE_APPLICATION_CREDENTIALS_JSON (para Render) o GOOGLE_APPLICATION_CREDENTIALS (para local)");
     }
     
     console.log("📱 Conectando a WhatsApp...");
