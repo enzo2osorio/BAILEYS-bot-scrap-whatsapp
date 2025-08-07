@@ -376,25 +376,55 @@ const clearUserState = (jid) => {
 
 // 📨 FUNCIONES PARA MENSAJES (botones eliminados, solo texto ahora)
 // Función para limpiar sesiones corruptas
+// Mejorar la función clearCorruptedSession
 const clearCorruptedSession = async () => {
   try {
+    console.log("🧹 Iniciando limpieza completa de sesión corrupta...");
+    
+    // 1. Cerrar conexión actual si existe
+    if (sock) {
+      try {
+        if (typeof sock.logout === 'function') {
+          await sock.logout();
+        } else if (typeof sock.end === 'function') {
+          sock.end();
+        }
+      } catch (logoutError) {
+        console.log("⚠️ Error en logout durante limpieza:", logoutError.message);
+      }
+    }
+    
+    // 2. Limpiar variables globales
+    qrDinamic = null;
+    sock = null;
+    
+    // 3. Limpiar carpeta de sesión
     const sessionPath = path.join(__dirname, "session_auth_info");
     if (fs.existsSync(sessionPath)) {
-      console.log("🧹 Limpiando sesión corrupta...");
+      console.log("🗑️ Eliminando carpeta de sesión...");
       fs.rmSync(sessionPath, { recursive: true, force: true });
-      console.log(
-        "✅ Sesión limpiada. Será necesario escanear el QR nuevamente."
-      );
+      console.log("✅ Carpeta de sesión eliminada");
     }
 
-    // También limpiar el store de Baileys si existe
+    // 4. Limpiar store de Baileys
     const storePath = path.join(__dirname, "baileys_store.json");
     if (fs.existsSync(storePath)) {
       fs.unlinkSync(storePath);
-      console.log("✅ Store de Baileys limpiado.");
+      console.log("✅ Store de Baileys limpiado");
     }
+    
+    // 5. Limpiar state map de usuarios
+    stateMap.clear();
+    console.log("✅ Estados de usuarios limpiados");
+    
+    // 6. Resetear contadores
+    global.reconnectAttempts = 0;
+    global.macErrorCount = 0;
+    
+    console.log("✅ Limpieza completa terminada - Se requerirá nuevo QR");
+    
   } catch (error) {
-    console.error("❌ Error limpiando sesión:", error);
+    console.error("❌ Error en limpieza de sesión:", error.message);
   }
 };
 
@@ -2027,6 +2057,30 @@ sock.ev.on("connection.update", async (update) => {
     console.log(`🔍 Conexión cerrada - Código: ${reason} | Error: ${lastDisconnect?.error?.message || 'Desconocido'}`);
     
     switch (reason) {
+
+       case 428:
+        console.log("🚫 Error 428: Connection Terminated - Sesión inválida detectada");
+        console.log("🧹 La sesión actual no es válida, requiere limpieza completa");
+        
+        // Limpiar sesión automáticamente
+        await clearCorruptedSession();
+        
+        // Detener el bucle de reconexión infinito
+        shouldReconnect = true;
+        reconnectDelay = 10000; // 10 segundos para dar tiempo a que se complete la limpieza
+        
+        // Limpiar variables globales inmediatamente
+        qrDinamic = null;
+        sock = null;
+        
+        // Mostrar mensaje de que necesita escanear QR nuevamente
+        console.log("📱 Será necesario escanear un nuevo código QR");
+        
+        if (soket) {
+          updateQR("loading");
+        }
+        break;
+
       case DisconnectReason.badSession:
         console.log("❌ Sesión corrupta detectada");
         console.log(`🧹 Limpiando sesión ${session} y requiriendo nuevo escaneo`);
@@ -2139,7 +2193,21 @@ sock.ev.on("connection.update", async (update) => {
     
     // 🔄 EJECUTAR RECONEXIÓN SI ES NECESARIA
     if (shouldReconnect) {
-      console.log(`🔄 Programando reconexión en ${reconnectDelay/1000} segundos...`);
+      // Implementar contador de intentos para evitar bucle infinito
+      if (!global.reconnectAttempts) global.reconnectAttempts = 0;
+      global.reconnectAttempts++;
+      
+      if (global.reconnectAttempts > 10) {
+        console.log("🛑 Demasiados intentos de reconexión - pausando por 5 minutos");
+        setTimeout(() => {
+          global.reconnectAttempts = 0;
+          console.log("🔄 Reiniciando contador de intentos, intentando reconectar...");
+          connectToWhatsApp().catch(err => console.log("Error en reconexión:", err.message));
+        }, 300000); // 5 minutos
+        return;
+      }
+      
+      console.log(`🔄 Intento ${global.reconnectAttempts}/10 - Programando reconexión en ${reconnectDelay/1000} segundos...`);
       
       // Limpiar variables globales antes de reconectar
       qrDinamic = null;
@@ -2150,49 +2218,37 @@ sock.ev.on("connection.update", async (update) => {
         updateQR("loading");
       }
       
-      // Implementar reconexión con retry exponencial
       setTimeout(async () => {
         try {
           console.log("🚀 Iniciando reconexión automática...");
           await connectToWhatsApp();
         } catch (reconnectError) {
           console.error("❌ Error en reconexión automática:", reconnectError.message);
-          
-          // Si falla la primera reconexión, intentar con delay más largo
-          console.log("🔄 Primera reconexión falló, intentando nuevamente en 60 segundos...");
-          setTimeout(async () => {
-            try {
-              await connectToWhatsApp();
-            } catch (secondError) {
-              console.error("❌ Segunda reconexión falló:", secondError.message);
-              console.log("🆘 Sistema requiere intervención manual o reinicio completo");
-            }
-          }, 60000); // 1 minuto para segundo intento
         }
       }, reconnectDelay);
     } else {
       console.log("🛑 Reconexión automática deshabilitada para este tipo de error");
     }
     
-  } else if (connection === "open") {
+} else if (connection === "open") {
     console.log("✅ Conexión WhatsApp establecida exitosamente");
+    
+    // Resetear contador de intentos al conectar exitosamente
+    global.reconnectAttempts = 0;
+    
     startConnectionHealthCheck();
-    // Resetear contadores de error
     global.macErrorCount = 0;
     global.lastMacErrorReset = Date.now();
     
-    // Actualizar UI
     if (soket) {
       updateQR("connected");
     }
     
-    // Log de información de la sesión
     if (sock?.user) {
       console.log(`👤 Usuario conectado: ${sock.user.name} (${sock.user.id})`);
     }
     
   } else if (connection === "connecting") {
-    
     console.log("🔄 Conectando a WhatsApp...");
     if (soket) {
       updateQR("loading");
