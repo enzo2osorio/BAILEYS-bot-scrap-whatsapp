@@ -1,3 +1,6 @@
+const supabase = require("../supabase");
+
+
 const getCategorias = async () => {
   try {
     console.log("🔍 Intentando obtener categorías de Supabase...");
