@@ -1,3 +1,5 @@
+const supabase = require("../supabase");
+
 const saveNewDestinatario = async (nombre, categoriaId, subcategoriaId) => {
   try {
     const { data, error } = await supabase
