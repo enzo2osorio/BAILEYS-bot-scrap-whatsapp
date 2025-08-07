@@ -238,6 +238,69 @@ app.get("/session-status/:accessKey", (req, res) => {
   }
 });
 
+// Agregar nueva ruta de diagnóstico después de las rutas existentes
+app.get("/connection-diagnostics/:accessKey", (req, res) => {
+  try {
+    const { accessKey } = req.params;
+    
+    // Verificar clave de acceso
+    const validAccessKey = process.env.SESSION_CLEAR_KEY || "default-clear-key-12345";
+    
+    if (accessKey !== validAccessKey) {
+      return res.status(401).json({
+        success: false,
+        message: "❌ Clave de acceso inválida"
+      });
+    }
+
+    const diagnostics = {
+      timestamp: new Date().toISOString(),
+      connection: {
+        isConnected: isConnected(),
+        hasSocket: !!sock,
+        hasUser: !!sock?.user,
+        userInfo: sock?.user ? {
+          id: sock.user.id,
+          name: sock.user.name
+        } : null,
+        readyState: sock?.readyState || 'N/A'
+      },
+      session: {
+        qrAvailable: !!qrDinamic,
+        sessionFolderExists: fs.existsSync(path.join(__dirname, "session_auth_info")),
+        storeExists: fs.existsSync(path.join(__dirname, "baileys_store.json"))
+      },
+      system: {
+        uptime: process.uptime(),
+        memoryUsage: process.memoryUsage(),
+        nodeVersion: process.version,
+        platform: process.platform
+      },
+      errors: {
+        lastMacErrorLog: global.lastMacErrorLog || null,
+        lastCallbackErrorLog: global.lastCallbackErrorLog || null,
+        macErrorCount: global.macErrorCount || 0
+      },
+      healthChecks: {
+        lastHealthLog: global.lastHealthLog || null,
+        healthCheckActive: !!connectionHealthInterval
+      }
+    };
+
+    res.status(200).json({
+      success: true,
+      message: "📊 Diagnóstico de conexión",
+      diagnostics
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "❌ Error obteniendo diagnóstico",
+      error: error.message
+    });
+  }
+});
 
 let sock;
 let qrDinamic;
@@ -477,7 +540,6 @@ async function connectToWhatsApp() {
 
         const messageId = msg.key.id;
         const senderName = contactStore[jid]?.name || jid.split("@")[0];
-        const timestamp = msg.messageTimestamp || Math.floor(Date.now() / 1000);
         const messageType = getContentType(msg.message);
         
         // 🚫 Filtrar mensajes de protocolo y otros tipos no relevantes
@@ -1908,57 +1970,235 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     });
   };
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    qrDinamic = qr;
-    if (connection === "close") {
-      let reason = new Boom(lastDisconnect.error).output.statusCode;
-      if (reason === DisconnectReason.badSession) {
-        console.log(
-          `Bad Session File, Please Delete ${session} and Scan Again`
-        );
-        // Limpiar sesión corrupta
-        await clearCorruptedSession();
-        sock.logout();
-      } else if (reason === DisconnectReason.connectionClosed) {
-        console.log("Conexión cerrada, reconectando....");
-        connectToWhatsApp();
-      } else if (reason === DisconnectReason.connectionLost) {
-        console.log("Conexión perdida del servidor, reconectando...");
-        connectToWhatsApp();
-      } else if (reason === DisconnectReason.connectionReplaced) {
-        console.log(
-          "Conexión reemplazada, otra nueva sesión abierta, cierre la sesión actual primero"
-        );
-        sock.logout();
-      } else if (reason === DisconnectReason.loggedOut) {
-        console.log(
-          `Dispositivo cerrado, elimínelo ${session} y escanear de nuevo.`
-        );
-        await clearCorruptedSession();
-        sock.logout();
-      } else if (reason === DisconnectReason.restartRequired) {
-        console.log("Se requiere reinicio, reiniciando...");
-        connectToWhatsApp();
-      } else if (reason === DisconnectReason.timedOut) {
-        console.log("Se agotó el tiempo de conexión, conectando...");
-        connectToWhatsApp();
-      } else {
-        console.log(
-          `Motivo de desconexión desconocido: ${reason}|${lastDisconnect.error}`
-        );
-        // Si hay errores repetidos de MAC, limpiar la sesión
-        if (lastDisconnect.error?.message?.includes("Bad MAC")) {
-          console.log("Error de MAC detectado, limpiando sesión...");
-          await clearCorruptedSession();
-        }
-        sock.end();
-      }
-    } else if (connection === "open") {
-      console.log("conexión abierta");
 
+  let connectionHealthInterval = null;
+
+const startConnectionHealthCheck = () => {
+  // Limpiar interval anterior si existe
+  if (connectionHealthInterval) {
+    clearInterval(connectionHealthInterval);
+  }
+  
+  connectionHealthInterval = setInterval(async () => {
+    try {
+      if (!sock || !sock.user) {
+        console.log("⚠️ Health check: Socket no conectado");
+        return;
+      }
+      
+      // Test básico de conectividad
+      const timestamp = Date.now();
+      const healthCheckPassed = sock.user && sock.readyState === 1; // WebSocket OPEN
+      
+      if (!healthCheckPassed) {
+        console.log("🚨 Health check falló - conexión inestable detectada");
+        console.log("🔄 Iniciando reconexión preventiva...");
+        
+        // Reconexión preventiva
+        setTimeout(() => {
+          connectToWhatsApp().catch(err => {
+            console.log("⚠️ Error en reconexión preventiva:", err.message);
+          });
+        }, 5000);
+      } else {
+        // Solo mostrar health check cada 10 minutos para no hacer spam
+        if (!global.lastHealthLog || timestamp - global.lastHealthLog > 600000) {
+          console.log("💚 Health check: Conexión estable");
+          global.lastHealthLog = timestamp;
+        }
+      }
+      
+    } catch (error) {
+      console.log("⚠️ Error en health check:", error.message);
     }
-  });
+  }, 120000); // Cada 2 minutos
+};
+
+  // Reemplazar el event handler connection.update (línea ~1800)
+sock.ev.on("connection.update", async (update) => {
+  const { connection, lastDisconnect, qr } = update;
+  qrDinamic = qr;
+  
+  if (connection === "close") {
+    let reason = new Boom(lastDisconnect?.error).output.statusCode;
+    let shouldReconnect = true;
+    let reconnectDelay = 5000; // 5 segundos por defecto
+    
+    console.log(`🔍 Conexión cerrada - Código: ${reason} | Error: ${lastDisconnect?.error?.message || 'Desconocido'}`);
+    
+    switch (reason) {
+      case DisconnectReason.badSession:
+        console.log("❌ Sesión corrupta detectada");
+        console.log(`🧹 Limpiando sesión ${session} y requiriendo nuevo escaneo`);
+        await clearCorruptedSession();
+        shouldReconnect = true;
+        reconnectDelay = 3000;
+        break;
+        
+      case DisconnectReason.connectionClosed:
+        console.log("🔌 Conexión cerrada por el servidor");
+        shouldReconnect = true;
+        reconnectDelay = 3000;
+        break;
+        
+      case DisconnectReason.connectionLost:
+        console.log("📶 Conexión perdida - reconectando...");
+        shouldReconnect = true;
+        reconnectDelay = 5000;
+        break;
+        
+      case DisconnectReason.connectionReplaced:
+        console.log("🔄 Conexión reemplazada por otra sesión");
+        console.log("⚠️ Otra instancia del bot está activa - cerrando esta sesión");
+        shouldReconnect = false;
+        try {
+          sock?.logout();
+        } catch (logoutError) {
+          console.log("⚠️ Error en logout:", logoutError.message);
+        }
+        break;
+        
+      case DisconnectReason.loggedOut:
+        console.log("🚪 Sesión cerrada remotamente");
+        console.log(`🧹 Limpiando sesión ${session} y requiriendo nuevo escaneo`);
+        await clearCorruptedSession();
+        shouldReconnect = true;
+        reconnectDelay = 3000;
+        break;
+        
+      case DisconnectReason.restartRequired:
+        console.log("🔄 WhatsApp requiere reinicio de sesión");
+        shouldReconnect = true;
+        reconnectDelay = 2000;
+        break;
+        
+      case DisconnectReason.timedOut:
+        console.log("⏰ Timeout de conexión - reconectando...");
+        shouldReconnect = true;
+        reconnectDelay = 10000; // 10 segundos para timeouts
+        break;
+        
+      // 🆕 MANEJO ESPECÍFICO PARA ERRORES 503 Y OTROS CÓDIGOS
+      case 503:
+        console.log("🌐 Error 503: Stream Errored (problema temporal del servidor)");
+        console.log("🔄 Implementando estrategia de reconexión gradual...");
+        shouldReconnect = true;
+        reconnectDelay = 15000; // 15 segundos para errores 503
+        break;
+        
+      case 500:
+        console.log("⚠️ Error 500: Error interno del servidor WhatsApp");
+        shouldReconnect = true;
+        reconnectDelay = 20000; // 20 segundos para errores internos
+        break;
+        
+      case 408:
+        console.log("⏰ Error 408: Request Timeout");
+        shouldReconnect = true;
+        reconnectDelay = 10000;
+        break;
+        
+      case 429:
+        console.log("🚫 Error 429: Rate Limited - esperando más tiempo...");
+        shouldReconnect = true;
+        reconnectDelay = 60000; // 1 minuto para rate limiting
+        break;
+        
+      default:
+        console.log(`❓ Código de desconexión desconocido: ${reason}`);
+        console.log(`📋 Error completo: ${lastDisconnect?.error?.message || 'Sin detalles'}`);
+        
+        // 🧠 ANÁLISIS INTELIGENTE DEL ERROR
+        const errorMessage = lastDisconnect?.error?.message || '';
+        
+        if (errorMessage.includes('Stream Errored')) {
+          console.log("🌊 Detectado error de stream - aplicando reconexión robusta");
+          shouldReconnect = true;
+          reconnectDelay = 15000;
+        } else if (errorMessage.includes('Bad MAC')) {
+          console.log("🔐 Error de MAC detectado - limpiando sesión");
+          await clearCorruptedSession();
+          shouldReconnect = true;
+          reconnectDelay = 5000;
+        } else if (errorMessage.includes('timeout')) {
+          console.log("⏰ Timeout detectado en mensaje de error");
+          shouldReconnect = true;
+          reconnectDelay = 10000;
+        } else if (errorMessage.includes('network') || errorMessage.includes('ECONNRESET')) {
+          console.log("📶 Error de red detectado");
+          shouldReconnect = true;
+          reconnectDelay = 8000;
+        } else {
+          // Error completamente desconocido - intentar reconectar con delay largo
+          console.log("❓ Error no identificado - reconectando con precaución");
+          shouldReconnect = true;
+          reconnectDelay = 30000; // 30 segundos para errores desconocidos
+        }
+        break;
+    }
+    
+    // 🔄 EJECUTAR RECONEXIÓN SI ES NECESARIA
+    if (shouldReconnect) {
+      console.log(`🔄 Programando reconexión en ${reconnectDelay/1000} segundos...`);
+      
+      // Limpiar variables globales antes de reconectar
+      qrDinamic = null;
+      sock = null;
+      
+      // Actualizar UI
+      if (soket) {
+        updateQR("loading");
+      }
+      
+      // Implementar reconexión con retry exponencial
+      setTimeout(async () => {
+        try {
+          console.log("🚀 Iniciando reconexión automática...");
+          await connectToWhatsApp();
+        } catch (reconnectError) {
+          console.error("❌ Error en reconexión automática:", reconnectError.message);
+          
+          // Si falla la primera reconexión, intentar con delay más largo
+          console.log("🔄 Primera reconexión falló, intentando nuevamente en 60 segundos...");
+          setTimeout(async () => {
+            try {
+              await connectToWhatsApp();
+            } catch (secondError) {
+              console.error("❌ Segunda reconexión falló:", secondError.message);
+              console.log("🆘 Sistema requiere intervención manual o reinicio completo");
+            }
+          }, 60000); // 1 minuto para segundo intento
+        }
+      }, reconnectDelay);
+    } else {
+      console.log("🛑 Reconexión automática deshabilitada para este tipo de error");
+    }
+    
+  } else if (connection === "open") {
+    console.log("✅ Conexión WhatsApp establecida exitosamente");
+    startConnectionHealthCheck();
+    // Resetear contadores de error
+    global.macErrorCount = 0;
+    global.lastMacErrorReset = Date.now();
+    
+    // Actualizar UI
+    if (soket) {
+      updateQR("connected");
+    }
+    
+    // Log de información de la sesión
+    if (sock?.user) {
+      console.log(`👤 Usuario conectado: ${sock.user.name} (${sock.user.id})`);
+    }
+    
+  } else if (connection === "connecting") {
+    
+    console.log("🔄 Conectando a WhatsApp...");
+    if (soket) {
+      updateQR("loading");
+    }
+  }
+});
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -1984,6 +2224,8 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
   //   }
   // );
 }
+
+
 
 
 async function downloadDocumentMessage(message, senderName, messageId) {
