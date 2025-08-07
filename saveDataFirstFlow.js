@@ -57,8 +57,6 @@ async function saveDataFirstFlow(params) {
        return {error: "Error al guardar el registro."};
    }
 
-   console.log("se guardoooOooOo")
-
    return {success : true, data: dataRegistro}; // Retorna el registro guardado o un mensaje de éxito
 }  
 

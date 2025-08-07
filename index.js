@@ -45,6 +45,8 @@ const STATES = {
   AWAITING_DESTINATARIO_SECOND_TRY: "awaiting_destinatario_second_try",
   AWAITING_DESTINATARIO_CHOOSING_IN_LIST_OR_ADDING_NEW: "awaiting_destinatario_choosing_in_list_or_adding_new", 
   AWAITING_NEW_DESTINATARIO_NAME: "awaiting_new_destinatario_name",
+  AWAITING_DESTINATARIO_ALIASES: "awaiting_destinatario_aliases", 
+  AWAITING_DESTINATARIO_FUZZY_CONFIRMATION: "awaiting_destinatario_fuzzy_confirmation", 
   AWAITING_CATEGORY_SELECTION: "awaiting_category_selection",
   AWAITING_SUBCATEGORY_SELECTION: "awaiting_subcategory_selection",
   AWAITING_MEDIO_PAGO_CONFIRMATION: "awaiting_medio_pago_confirmation",
@@ -74,6 +76,9 @@ const server = require("http").createServer(app);
 const io = require("socket.io")(server);
 const port = process.env.PORT || 8000;
 const qrcode = require("qrcode");
+const checkSimilarDestinatario = require("./utils/checkSimilarDestinatario");
+const saveDestinatarioAliases = require("./utils/saveDestinatarioAliases");
+const checkDuplicateAliases = require("./utils/checkDuplicateAliases");
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
 
@@ -88,41 +93,151 @@ app.get("/", (req, res) => {
   res.send("server working");
 });
 
-// 🧹 Endpoint para limpiar archivos de sesión manualmente
-app.post("/cleanup-session", async (req, res) => {
+// 🧹 Ruta para limpiar sesión con clave de acceso
+app.get("/clear-session/:accessKey", async (req, res) => {
   try {
-    const { cleanupSessionFiles } = require('./utils/cleanupSessionFiles');
-    await cleanupSessionFiles();
-    res.json({ 
-      success: true, 
-      message: "Limpieza de archivos de sesión completada" 
+    const { accessKey } = req.params;
+    
+    // Verificar clave de acceso
+    const validAccessKey = process.env.SESSION_CLEAR_KEY || "default-clear-key-12345";
+    
+    if (accessKey !== validAccessKey) {
+      console.log(`🚫 Intento de acceso no autorizado a /clear-session con clave: ${accessKey}`);
+      return res.status(401).json({
+        success: false,
+        message: "❌ Clave de acceso inválida"
+      });
+    }
+
+    console.log("🧹 Iniciando limpieza de sesión autorizada...");
+
+    // 1. Cerrar conexión actual de forma segura si existe
+    let socketWasClosed = false;
+    if (sock) {
+      try {
+        if (typeof sock.logout === 'function') {
+          console.log("🔌 Cerrando sesión de WhatsApp...");
+          await sock.logout();
+          socketWasClosed = true;
+        } else if (typeof sock.end === 'function') {
+          console.log("🔌 Cerrando conexión actual...");
+          sock.end();
+          socketWasClosed = true;
+        }
+      } catch (logoutError) {
+        console.log("⚠️ Error en logout (continuando con limpieza):", logoutError.message);
+      }
+    } else {
+      console.log("ℹ️ No hay conexión activa para cerrar");
+    }
+
+    // 2. Limpiar variables globales inmediatamente
+    qrDinamic = null;
+    sock = null;
+
+    // 3. Limpiar carpeta de sesión de WhatsApp
+    const sessionPath = path.join(__dirname, "session_auth_info");
+    let sessionFolderRemoved = false;
+    
+    if (fs.existsSync(sessionPath)) {
+      console.log("🗑️ Eliminando carpeta de sesión de WhatsApp...");
+      fs.rmSync(sessionPath, { recursive: true, force: true });
+      sessionFolderRemoved = true;
+      console.log("✅ Carpeta de sesión eliminada");
+    } else {
+      console.log("ℹ️ Carpeta de sesión no existe");
+    }
+
+    // 4. Limpiar store de Baileys si existe
+    const storePath = path.join(__dirname, "baileys_store.json");
+    let baileysStoreRemoved = false;
+    
+    if (fs.existsSync(storePath)) {
+      fs.unlinkSync(storePath);
+      baileysStoreRemoved = true;
+      console.log("✅ Store de Baileys eliminado");
+    }
+
+    // 5. Actualizar cliente web si está conectado
+    if (soket) {
+      updateQR("loading");
+    }
+
+    // 6. Respuesta exitosa
+    res.status(200).json({
+      success: true,
+      message: "✅ Sesión de WhatsApp limpiada exitosamente. Puedes escanear un nuevo QR manualmente.",
+      timestamp: new Date().toISOString(),
+      cleaned: {
+        socketClosed: socketWasClosed,
+        sessionFolderRemoved: sessionFolderRemoved,
+        baileysStoreRemoved: baileysStoreRemoved
+      },
+      next_steps: [
+        "1. Ve a http://localhost:8000/scan",
+        "2. Escanea el nuevo QR code con tu WhatsApp",
+        "3. El bot estará listo para usar"
+      ]
     });
+
+    console.log("🎯 Sesión limpiada. Listo para nuevo QR manual.");
+
   } catch (error) {
-    console.error("Error en limpieza manual:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Error en la limpieza de sesión" 
+    console.error("❌ Error limpiando sesión:", error.message);
+    
+    res.status(500).json({
+      success: false,
+      message: "❌ Error interno limpiando sesión",
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
   }
 });
 
-// 🔥 Endpoint para limpieza AGRESIVA (elimina casi todo)
-app.post("/cleanup-session-aggressive", async (req, res) => {
+// 🔍 Ruta adicional para verificar estado de la sesión
+app.get("/session-status/:accessKey", (req, res) => {
   try {
-    const { aggressiveCleanup } = require('./utils/cleanupSessionFiles');
-    await aggressiveCleanup();
-    res.json({ 
-      success: true, 
-      message: "Limpieza agresiva completada - pre-keys se regenerarán automáticamente" 
+    const { accessKey } = req.params;
+    
+    // Verificar clave de acceso
+    const validAccessKey = process.env.SESSION_CLEAR_KEY || "default-clear-key-12345";
+    
+    if (accessKey !== validAccessKey) {
+      return res.status(401).json({
+        success: false,
+        message: "❌ Clave de acceso inválida"
+      });
+    }
+
+    const sessionPath = path.join(__dirname, "session_auth_info");
+    const storePath = path.join(__dirname, "baileys_store.json");
+    const tempCredPath = path.join(__dirname, 'gcloud-creds.json');
+
+    res.status(200).json({
+      success: true,
+      message: "✅ Estado de la sesión",
+      timestamp: new Date().toISOString(),
+      session: {
+        connected: isConnected(),
+        hasUser: sock?.user ? true : false,
+        userId: sock?.user?.id || null,
+        userName: sock?.user?.name || null,
+        sessionFolderExists: fs.existsSync(sessionPath),
+        baileysStoreExists: fs.existsSync(storePath),
+        googleCredentialsExists: fs.existsSync(tempCredPath),
+        qrAvailable: qrDinamic ? true : false
+      }
     });
+
   } catch (error) {
-    console.error("Error en limpieza agresiva:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Error en la limpieza agresiva" 
+    res.status(500).json({
+      success: false,
+      message: "❌ Error obteniendo estado",
+      error: error.message
     });
   }
 });
+
 
 let sock;
 let qrDinamic;
@@ -132,13 +247,6 @@ let soket;
 let messageStore = {};
 let contactStore = {};
 let chatStore = {};
-
-
-const ALLOWED_NUMBERS = [
-  "51950306310@s.whatsapp.net",
-  "5492236849095@s.whatsapp.net", 
-  "5492234214038@s.whatsapp.net"
-];
 
 // Función para crear el store de Baileys
 const initStore = () => {
@@ -285,7 +393,6 @@ async function connectToWhatsApp() {
     syncFullHistory: false, // ⚠️ CRÍTICO: Mantener en false para evitar errores MAC
     markOnlineOnConnect: false,
     browser: Browsers.windows("Desktop"),
-    cachedGroupMetadata: true,
     // 🛡️ CONFIGURACIONES OPTIMIZADAS PARA REDUCIR ERRORES MAC
     retryRequestDelayMs: 5000, // 5 segundos entre reintentos
     maxMsgRetryCount: 1, // Solo 1 reintento para evitar loops
@@ -298,22 +405,11 @@ async function connectToWhatsApp() {
     defaultQueryTimeoutMs: 20000, // 20 segundos
     keepAliveIntervalMs: 60000, // 1 minuto keep alive
     // 🛡️ MANEJO DE ERRORES DE DESCIFRADO
-    getMessage: async (key) => {
-      // No intentar recuperar mensajes que causan errores MAC
-      return undefined;
-    },
-    // 🧹 CONFIGURACIONES PARA REDUCIR ALMACENAMIENTO DE SESIONES
-    shouldIgnoreJid: (jid) => {
-      // Ignorar grupos y números no permitidos en el nivel de sesión
-      if (jid.includes('@g.us')) {
-        return true; // Ignorar todos los grupos
-      }
-      return !ALLOWED_NUMBERS.includes(jid);
-    },
+    // getMessage: async (key) => {
+    //   // No intentar recuperar mensajes que causan errores MAC
+    //   return undefined;
+    // },
     // Reducir caché de contactos
-    shouldCacheContact: (jid) => {
-      return ALLOWED_NUMBERS.includes(jid);
-    }
   });
 
   // Vincular el store al socket si está disponible
@@ -377,11 +473,7 @@ async function connectToWhatsApp() {
         if (!msg.message || !msg.key?.remoteJid) continue;
 
         const jid = msg.key.remoteJid;
-
-        if (!ALLOWED_NUMBERS.includes(jid)) {
-        console.log(`🚫 Mensaje ignorado de número no permitido: ${jid}`);
-        continue; // Saltar al siguiente mensaje
-      }
+        console.log(`🔍 Mensaje recibido de: ${jid}`);
 
         const messageId = msg.key.id;
         const senderName = contactStore[jid]?.name || jid.split("@")[0];
@@ -397,12 +489,9 @@ async function connectToWhatsApp() {
         }
         
         console.log({messageType})
-        console.log(`📩 Nuevo mensaje de ${senderName} (${jid})`);
+        if (jid === process.env.NUMBER_1_ALLOWED || jid === process.env.MY_NUMBER) {
 
-        // Solo procesar mensajes de números específicos
-        if (jid === "51950306310@s.whatsapp.net" || jid === "5492236849095@s.whatsapp.net" || jid === "5492234214038@s.whatsapp.net") {
-          console.log({msg});
-          // 🔄 Verificar estado actual del usuario
+        // 🔄 Verificar estado actual del usuario
           const userState = getUserState(jid);
           console.log(`🔍 Estado actual de ${senderName}: ${userState.state}`);
 
@@ -429,6 +518,17 @@ async function connectToWhatsApp() {
             
             if (userState.state === STATES.AWAITING_NEW_DESTINATARIO_NAME) {
               await handleNewDestinatarioName(jid, textMessage, userState, msg);
+              continue;
+            }
+
+            if (userState.state === STATES.AWAITING_DESTINATARIO_FUZZY_CONFIRMATION) {
+              await handleDestinatarioFuzzyConfirmation(jid, textMessage, userState, msg);
+              continue;
+            }
+
+            // 🆕 NUEVO HANDLER  
+            if (userState.state === STATES.AWAITING_DESTINATARIO_ALIASES) {
+              await handleDestinatarioAliases(jid, textMessage, userState, msg);
               continue;
             }
             
@@ -515,8 +615,6 @@ async function connectToWhatsApp() {
               // 📄 Manejo de documentos (PDFs, etc.)
               const documentCaption = msg.message.documentWithCaptionMessage.caption || "";
               const fileName = msg.message.documentWithCaptionMessage.message?.documentMessage?.fileName || "";
-              const paraDepurar = msg.message.documentWithCaptionMessage
-              console.log({paraDepurar})
               console.log(`📄 Documento recibido: ${fileName}`);
               
               // 📥 Descargar documento
@@ -798,6 +896,8 @@ Responde únicamente con el JSON, sin texto adicional.
     }
   };
 
+
+
   // 📋 Mostrar lista completa de destinatarios
   const showAllDestinatariosList = async (jid, structuredData) => {
     try {
@@ -806,8 +906,6 @@ Responde únicamente con el JSON, sin texto adicional.
         .from('destinatarios')
         .select('id, name')
         .order('name');
-
-        console.log({allDestinatarios})
 
       if (error) {
         console.error("Error obteniendo destinatarios:", error);
@@ -985,9 +1083,7 @@ const saveNewMetodoPago = async (name) => {
   // 🔄 Manejar selección de la lista completa de destinatarios
   const handleChoosingInListOrAddingNew = async (jid, textMessage, userState, quotedMsg) => {
     const option = parseInt(textMessage.trim());
-    console.log(`🔍 Opción seleccionada: ${option}`);
     const allDestinatarios = userState.data.allDestinatarios;
-    console.log({allDestinatarios})
     const maxOption = allDestinatarios.length + 1; // +1 porque empezamos desde el índice 2
     const isModification = userState.data.isModification || false;
 
@@ -1068,48 +1164,77 @@ const saveNewMetodoPago = async (name) => {
     }
   };
 
-  // 📝 Manejar nombre de nuevo destinatario
-   const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg) => {
-    const nombreCanonico = textMessage.trim();
-    
-    if (!nombreCanonico) {
-      await sock.sendMessage(jid, { text: "⚠️ Por favor, ingresa un nombre válido." });
+
+  // Reemplazar la función handleNewDestinatarioName (línea ~1275)
+// Reemplazar la función handleNewDestinatarioName
+const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg) => {
+  const nombreCanonico = textMessage.trim();
+  
+  if (!nombreCanonico) {
+    await sock.sendMessage(jid, { text: "⚠️ Por favor, ingresa un nombre válido." });
+    return;
+  }
+
+  console.log(`🔍 Procesando nuevo destinatario: "${nombreCanonico}"`);
+  
+  // 🎯 VERIFICAR SI EXISTE UN DESTINATARIO SIMILAR
+  const similarMatch = await checkSimilarDestinatario(nombreCanonico);
+  
+  if (similarMatch) {
+    // 🎯 NUEVA LÓGICA: Coincidencia exacta - usar automáticamente
+    if (similarMatch.isExactMatch) {
+      console.log(`🎯 Coincidencia exacta encontrada: ${similarMatch.destinatario.name} - usando automáticamente`);
+      
+      await sock.sendMessage(jid, {
+        text: `🎯 El destinatario "*${nombreCanonico}*" ya existe en el sistema.\n\n` +
+        `✅ Se usará el destinatario existente: *${similarMatch.destinatario.name}*\n\n` +
+        `💡 Se realizó una búsqueda en el sistema y se encontró una coincidencia exacta.`
+      });
+
+      // Verificar si estamos en modo modificación
+      const isModification = userState.data.isModification || userState.data.finalStructuredData;
+      
+      if (isModification) {
+        // Actualizar destinatario en modificación
+        const updatedData = {
+          ...userState.data.finalStructuredData,
+          nombre: similarMatch.destinatario.name
+        };
+        console.log('🔧 Destinatario exacto encontrado en modificación:', similarMatch.destinatario.name);
+        await sock.sendMessage(jid, { text: `✅ Destinatario actualizado a: ${similarMatch.destinatario.name}` });
+        await proceedToFinalConfirmationFromModification(jid, updatedData);
+      } else {
+        // Flujo normal - proceder a verificar método de pago
+        await proceedToFinalConfirmation(jid, similarMatch.destinatario.name, userState.data.structuredData);
+      }
       return;
     }
-
-    // Actualizar datos con el nombre
-    const updatedData = { 
-      ...userState.data, 
-      newDestinatarioName: nombreCanonico 
-    };
-
-    setUserState(jid, STATES.AWAITING_CATEGORY_SELECTION, updatedData);
-
-    // Obtener y mostrar categorías
-    const categorias = await getCategorias();
     
-    if (categorias.length === 0) {
-      await sock.sendMessage(jid, { text: "❌ No se pudieron cargar las categorías. Intenta más tarde." });
-      clearUserState(jid);
-      return;
-    }
-
-    // Crear lista numerada de categorías
-    const categoryList = categorias.map((cat, index) => 
-      `${index + 1}. ${cat.name}`
-    ).join('\n');
-
-    // Guardar categorías en el estado para mapear el número luego
-    const updatedDataWithCategories = {
-      ...updatedData,
-      availableCategories: categorias
-    };
-    setUserState(jid, STATES.AWAITING_CATEGORY_SELECTION, updatedDataWithCategories);
-
-    await sock.sendMessage(jid, {
-      text: `✅ Nombre guardado: *${nombreCanonico}*\n\n📂 Elige una categoría escribiendo el número:\n\n${categoryList}\n\nEscribe solo el número de la categoría que deseas.`
+    // 🔍 LÓGICA EXISTENTE: Coincidencia similar - preguntar al usuario
+    console.log(`🔍 Destinatario similar encontrado: ${similarMatch.destinatario.name} (score: ${similarMatch.score})`);
+    
+    setUserState(jid, STATES.AWAITING_DESTINATARIO_FUZZY_CONFIRMATION, {
+      ...userState.data,
+      nombreCanonicoNuevo: nombreCanonico,
+      destinatarioSimilar: similarMatch.destinatario
     });
-  };
+    
+    await sock.sendMessage(jid, {
+      text: `🔍 Revisando todo el listado de destinatarios, he encontrado uno parecido:\n\n` +
+      `*${similarMatch.destinatario.name}*\n\n` +
+      `¿Qué deseas hacer?\n\n` +
+      `1. ✅ Usar "${similarMatch.destinatario.name}"\n` +
+      `2. ➕ Crear nuevo "${nombreCanonico}"\n` +
+      `3. ❌ Cancelar\n\n` +
+      `Escribe el número de tu opción:`
+    });
+    
+  } else {
+    // No hay destinatarios similares, proceder directamente a pedir aliases
+    console.log(`✅ No hay destinatarios similares, procediendo con: "${nombreCanonico}"`);
+    await proceedToAliasesInput(jid, nombreCanonico, userState.data);
+  }
+};
 
    const handleMedioPagoConfirmation = async (jid, textMessage, userState, quotedMsg) => {
     const option = parseInt(textMessage.trim());
@@ -1132,6 +1257,133 @@ const saveNewMetodoPago = async (name) => {
         break;
     }
   };
+
+// 🔘 Manejar confirmación de destinatario similar (fuzzy matching)
+const handleDestinatarioFuzzyConfirmation = async (jid, textMessage, userState, quotedMsg) => {
+  const option = parseInt(textMessage.trim());
+  
+  if (isNaN(option) || option < 1 || option > 3) {
+    await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
+    return;
+  }
+
+  switch (option) {
+    case 1: // Usar destinatario existente
+      const destinatarioExistente = userState.data.destinatarioSimilar;
+      console.log(`✅ Usuario eligió destinatario existente: ${destinatarioExistente.name}`);
+      
+      // Verificar si estamos en modo modificación
+      const isModification = userState.data.isModification || userState.data.finalStructuredData;
+      
+      if (isModification) {
+        // Actualizar destinatario en modificación
+        const updatedData = {
+          ...userState.data.finalStructuredData,
+          nombre: destinatarioExistente.name
+        };
+        console.log('🔧 Destinatario existente seleccionado en modificación:', destinatarioExistente.name);
+        await sock.sendMessage(jid, { text: `✅ Destinatario actualizado a: ${destinatarioExistente.name}` });
+        await proceedToFinalConfirmationFromModification(jid, updatedData);
+      } else {
+        // Flujo normal - proceder a verificar método de pago
+        await proceedToFinalConfirmation(jid, destinatarioExistente.name, userState.data.structuredData);
+      }
+      break;
+      
+    case 2: // Crear nuevo destinatario
+      const nombreNuevo = userState.data.nombreCanonicoNuevo;
+      console.log(`✅ Usuario eligió crear nuevo destinatario: ${nombreNuevo}`);
+      await proceedToAliasesInput(jid, nombreNuevo, userState.data);
+      break;
+      
+    case 3: // Cancelar
+      await sock.sendMessage(jid, { text: "❌ Operación cancelada." });
+      clearUserState(jid);
+      break;
+  }
+};
+
+
+// Agregar después de handleDestinatarioFuzzyConfirmation
+// 📝 Proceder a solicitar aliases del destinatario
+const proceedToAliasesInput = async (jid, nombreCanonico, userData) => {
+  // Actualizar datos con el nombre
+  const updatedData = { 
+    ...userData, 
+    newDestinatarioName: nombreCanonico 
+  };
+
+  setUserState(jid, STATES.AWAITING_DESTINATARIO_ALIASES, updatedData);
+
+  await sock.sendMessage(jid, {
+    text: `✅ Nombre guardado: *${nombreCanonico}*\n\n` +
+    `📝 Ahora, si deseas puedes agregar "seudónimos" para *${nombreCanonico}*, escribe los nombres separados por una coma, sigue el siguiente ejemplo:\n\n` +
+    `*Nombre canónico:* Confitería Alamos\n` +
+    `*Aliases:* Confitería, Alamos, Los Alamos, Iván Alamos...\n\n` +
+    `Esto servirá para mejorar la precisión al momento de filtrar los nombres de cada destinatario.\n\n` +
+    `💡 Si no deseas agregar aliases, escribe "skip" o "0" para continuar.`
+  });
+};
+
+
+// Agregar después de proceedToAliasesInput
+// 📝 Manejar entrada de aliases del destinatario
+// Reemplazar la función handleDestinatarioAliases (línea ~1310)
+const handleDestinatarioAliases = async (jid, textMessage, userState, quotedMsg) => {
+  const input = textMessage.trim();
+  
+  // Verificar si el usuario quiere saltarse los aliases
+  if (input.toLowerCase() === "skip" || input === "0") {
+    console.log(`⏭️ Usuario decidió saltarse aliases para: ${userState.data.newDestinatarioName}`);
+    await proceedToCategorySelection(jid, userState.data, []);
+    return;
+  }
+  
+  // Procesar aliases separados por coma
+  const aliases = input.split(',')
+    .map(alias => alias.trim())
+    .filter(alias => alias.length > 0);
+  
+  if (aliases.length === 0) {
+    await sock.sendMessage(jid, { 
+      text: "⚠️ No se detectaron aliases válidos. Separa los nombres con comas o escribe 'skip' para continuar sin aliases." 
+    });
+    return;
+  }
+  
+  console.log(`📝 ${aliases.length} aliases procesados para ${userState.data.newDestinatarioName}:`, aliases);
+  
+  // 🔍 VERIFICAR DUPLICADOS ANTES DE GUARDAR
+  const { validAliases, duplicates, errors } = await checkDuplicateAliases(aliases);
+  
+  // Construir mensaje de respuesta
+  let responseMessage = "";
+  
+  if (validAliases.length > 0) {
+    responseMessage += `✅ ${validAliases.length} seudónimos válidos:\n• ${validAliases.join('\n• ')}\n\n`;
+  }
+  
+  if (duplicates.length > 0) {
+    responseMessage += `⚠️ ${duplicates.length} seudónimos ya existen (ignorados):\n• ${duplicates.join('\n• ')}\n\n`;
+  }
+  
+  if (errors.length > 0) {
+    responseMessage += `❌ ${errors.length} seudónimos con errores (ignorados):\n• ${errors.join('\n• ')}\n\n`;
+  }
+  
+  if (validAliases.length === 0) {
+    responseMessage += "⚠️ No hay seudónimos nuevos para agregar.\n\n";
+  }
+  
+  responseMessage += "Continuando con las categorías...";
+  
+  await sock.sendMessage(jid, { text: responseMessage });
+  
+  // Proceder a selección de categoría con solo los aliases válidos
+  await proceedToCategorySelection(jid, userState.data, validAliases);
+};
+
+
 
   const showAllMetodosPagoList = async (jid, structuredData) => {
   try {
@@ -1165,6 +1417,43 @@ const saveNewMetodoPago = async (name) => {
     await sock.sendMessage(jid, { text: "❌ Error mostrando la lista de métodos de pago." });
     clearUserState(jid);
   }
+};
+
+  // Agregar después de handleDestinatarioAliases
+// 📂 Proceder a selección de categoría con aliases
+const proceedToCategorySelection = async (jid, userData, aliases) => {
+  // Actualizar datos con aliases
+  const updatedData = { 
+    ...userData, 
+    destinatarioAliases: aliases 
+  };
+
+  setUserState(jid, STATES.AWAITING_CATEGORY_SELECTION, updatedData);
+
+  // Obtener y mostrar categorías
+  const categorias = await getCategorias();
+  
+  if (categorias.length === 0) {
+    await sock.sendMessage(jid, { text: "❌ No se pudieron cargar las categorías. Intenta más tarde." });
+    clearUserState(jid);
+    return;
+  }
+
+  // Crear lista numerada de categorías
+  const categoryList = categorias.map((cat, index) => 
+    `${index + 1}. ${cat.name}`
+  ).join('\n');
+
+  // Guardar categorías en el estado para mapear el número luego
+  const updatedDataWithCategories = {
+    ...updatedData,
+    availableCategories: categorias
+  };
+  setUserState(jid, STATES.AWAITING_CATEGORY_SELECTION, updatedDataWithCategories);
+
+  await sock.sendMessage(jid, {
+    text: `📂 Elige una categoría escribiendo el número:\n\n${categoryList}\n\nEscribe solo el número de la categoría que deseas.`
+  });
 };
 
   // � Manejar selección numérica de categoría
@@ -1237,40 +1526,55 @@ const saveNewMetodoPago = async (name) => {
   };
 
   // 📁 Manejar selección de subcategoría
-  const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
-    // Guardar nuevo destinatario
-    const newDestinatario = await saveNewDestinatario(
-      userData.newDestinatarioName,
-      userData.selectedCategoriaId,
-      subcategoriaId
-    );
+  // Reemplazar la función handleSubcategorySelection (línea ~1350)
+const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
+  // Guardar nuevo destinatario
+  const newDestinatario = await saveNewDestinatario(
+    userData.newDestinatarioName,
+    userData.selectedCategoriaId,
+    subcategoriaId
+  );
 
-    if (!newDestinatario) {
-      await sock.sendMessage(jid, { text: "❌ Error guardando el destinatario. Intenta más tarde." });
-      clearUserState(jid);
-      return;
-    }
+  if (!newDestinatario) {
+    await sock.sendMessage(jid, { text: "❌ Error guardando el destinatario. Intenta más tarde." });
+    clearUserState(jid);
+    return;
+  }
 
-    await sock.sendMessage(jid, { 
-      text: `✅ Destinatario *${userData.newDestinatarioName}* creado exitosamente.` 
-    });
+  console.log(`✅ Destinatario creado: ${userData.newDestinatarioName} (ID: ${newDestinatario.id})`);
 
-    // Verificar si estamos en modo modificación
-    const isModification = userData.isModification || userData.finalStructuredData;
+  // 🆕 GUARDAR ALIASES SI EXISTEN
+  if (userData.destinatarioAliases && userData.destinatarioAliases.length > 0) {
+    console.log(`📝 Guardando ${userData.destinatarioAliases.length} aliases...`);
+    const aliasesGuardados = await saveDestinatarioAliases(newDestinatario.id, userData.destinatarioAliases);
     
-    if (isModification) {
-      // Actualizar destinatario en los datos existentes para modificación
-      const updatedData = {
-        ...userData.finalStructuredData,
-        nombre: userData.newDestinatarioName
-      };
-      console.log('🔧 Nuevo destinatario creado en modificación:', userData.newDestinatarioName);
-      await proceedToFinalConfirmationFromModification(jid, updatedData);
+    if (aliasesGuardados) {
+      console.log(`✅ Aliases guardados para destinatario: ${userData.newDestinatarioName}`);
     } else {
-      // Flujo normal - verificar método de pago después de crear nuevo destinatario
-      await proceedToFinalConfirmation(jid, userData.newDestinatarioName, userData.structuredData);
+      console.warn(`⚠️ Error guardando aliases, pero destinatario creado exitosamente`);
     }
-  };
+  }
+
+  await sock.sendMessage(jid, { 
+    text: `✅ Destinatario *${userData.newDestinatarioName}* creado exitosamente${userData.destinatarioAliases?.length ? ` con ${userData.destinatarioAliases.length} seudónimos` : ''}.` 
+  });
+
+  // Verificar si estamos en modo modificación
+  const isModification = userData.isModification || userData.finalStructuredData;
+  
+  if (isModification) {
+    // Actualizar destinatario en los datos existentes para modificación
+    const updatedData = {
+      ...userData.finalStructuredData,
+      nombre: userData.newDestinatarioName
+    };
+    console.log('🔧 Nuevo destinatario creado en modificación:', userData.newDestinatarioName);
+    await proceedToFinalConfirmationFromModification(jid, updatedData);
+  } else {
+    // Flujo normal - verificar método de pago después de crear nuevo destinatario
+    await proceedToFinalConfirmation(jid, userData.newDestinatarioName, userData.structuredData);
+  }
+};
 
   // ✅ Proceder a confirmación final
   const proceedToFinalConfirmation = async (jid, destinatarioName, structuredData) => {
@@ -1898,58 +2202,6 @@ async function downloadMediaByUser(message, messageType, senderJid, messageId) {
   }
 }
 
-// 📝 FUNCIÓN PARA GUARDAR MENSAJE EN LOG JSON POR CHAT
-async function saveMessageToLog(messageData) {
-  try {
-    // Crear carpeta de logs si no existe
-    const logsDir = path.join(__dirname, "chat-logs");
-    await fs.promises.mkdir(logsDir, { recursive: true });
-
-    // Crear nombre de archivo seguro basado en el JID
-    const sanitizedJid = messageData.sender.replace(/[@.:]/g, "_");
-    const logPath = path.join(logsDir, `${sanitizedJid}.json`);
-
-    let messages = [];
-
-    // Leer log existente del chat específico
-    if (fs.existsSync(logPath)) {
-      try {
-        const existingData = await fs.promises.readFile(logPath, "utf8");
-        messages = JSON.parse(existingData);
-      } catch (error) {
-        console.log(`Creando nuevo log para ${messageData.senderName}...`);
-        messages = [];
-      }
-    }
-
-    // 🔍 VERIFICAR DUPLICADOS ANTES DE AGREGAR
-    const existingMsg = messages.find((msg) => msg.id === messageData.id);
-    if (existingMsg) {
-      console.log(`⚠️ Mensaje ${messageData.id} ya existe, evitando duplicado`);
-      return; // No guardar si ya existe
-    }
-
-    // Agregar nuevo mensaje
-    messages.push(messageData);
-
-    // Ordenar mensajes por timestamp para mantener orden cronológico
-    messages.sort((a, b) => a.timestamp - b.timestamp);
-
-    // Mantener solo los últimos 2000 mensajes por chat para no llenar el disco
-    if (messages.length > 2000) {
-      messages = messages.slice(-2000);
-    }
-
-    // Guardar log actualizado del chat específico
-    await fs.promises.writeFile(logPath, JSON.stringify(messages, null, 2));
-
-    console.log(
-      `📝 Mensaje guardado en log de ${messageData.senderName}: ${messageData.type} (${messages.length} mensajes total)`
-    );
-  } catch (error) {
-    console.error("Error guardando mensaje en log:", error.message);
-  }
-}
 
 const isConnected = () => {
   return sock?.user ? true : false;
@@ -2481,7 +2733,5 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Promesa rechazada no manejada:', errorMessage);
 });
 
-// 🧹 Iniciar limpieza periódica de archivos de sesión
-startPeriodicCleanup();
 
 startApp();
