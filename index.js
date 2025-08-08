@@ -7,6 +7,9 @@ const {
   getContentType,
   Browsers,
 } = require("@whiskeysockets/baileys");
+const dns = require('dns');
+dns.setDefaultResultOrder?.('ipv4first');
+const { useMongoAuthState, clearMongoAuthState } = require('./utils/mongo/mongo-adapter.js'); // <- usar nuestro adaptador
 const log = (pino = require("pino"));
 const { Boom } = require("@hapi/boom");
 const path = require("path");
@@ -18,21 +21,22 @@ const bodyParser = require("body-parser");
 const dotenv = require("dotenv");
 const openAI = require("openai");
 const vision = require("@google-cloud/vision");
-const destinatarios = require('./similarDestinatarios');
-const matchDestinatario = require('./utils/findMatchDestinatario');
-const supabase = require('./supabase');
-const { uploadFileToSupabase, downloadFileFromSupabase, cleanupTempFile } = require('./utils/supabaseStorage');
-const saveDataFirstFlow = require("./saveDataFirstFlow");
-const getCategorias = require('./utils/getCategorias');
-const getSubcategorias = require('./utils/getSubcategorias');
-const getMetodosPago = require('./utils/getMetodosPago');
-const saveNewDestinatario = require('./utils/saveNewDestinatario');
-const matchMetodoPago = require('./utils/findMatchMetodoPago');
-const { startPeriodicCleanup } = require('./utils/cleanupSessionFiles');
+const destinatarios = require('./similarDestinatarios.js');
+const matchDestinatario = require('./utils/findMatchDestinatario.js');
+const supabase = require('./supabase.js');
+const { initInstanceLock, getActiveLockInfo } = require('./utils/mongo/lock-mongo.js');
+const { uploadFileToSupabase, downloadFileFromSupabase, cleanupTempFile } = require('./utils/supabaseStorage.js');
+const saveDataFirstFlow = require("./saveDataFirstFlow.js");
+const getCategorias = require('./utils/getCategorias.js');
+const getSubcategorias = require('./utils/getSubcategorias.js');
+const getMetodosPago = require('./utils/getMetodosPago.js');
+const saveNewDestinatario = require('./utils/saveNewDestinatario.js');
+const matchMetodoPago = require('./utils/findMatchMetodoPago.js');
+const { startPeriodicCleanup } = require('./utils/cleanupSessionFiles.js');
 
 dotenv.config();
 
-
+let instanceLockRelease = null;
 // TODO: AGREGAR ESTADOS PARA MANEJAR EL METODO DE PAGO PARECIDO AL MANEJO DE DESTINATARIO.
 // 🔄 SISTEMA DE ESTADO PERSISTENTE POR USUARIO
 const stateMap = new Map();
@@ -76,9 +80,9 @@ const server = require("http").createServer(app);
 const io = require("socket.io")(server);
 const port = process.env.PORT || 8000;
 const qrcode = require("qrcode");
-const checkSimilarDestinatario = require("./utils/checkSimilarDestinatario");
-const saveDestinatarioAliases = require("./utils/saveDestinatarioAliases");
-const checkDuplicateAliases = require("./utils/checkDuplicateAliases");
+const checkSimilarDestinatario = require("./utils/checkSimilarDestinatario.js");
+const saveDestinatarioAliases = require("./utils/saveDestinatarioAliases.js");
+const checkDuplicateAliases = require("./utils/checkDuplicateAliases.js");
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
 
@@ -91,6 +95,20 @@ app.get("/scan", (req, res) => {
 app.get("/", (req, res) => {
   console.log("Server is running again");
   res.send("server working");
+});
+
+app.get('/lock-info', async (req, res) => {
+  try {
+    const doc = await getActiveLockInfo({
+      mongoUrl: process.env.MONGO_URI,
+      dbName: process.env.MONGODB_DB || 'baileysss',
+      collectionName: process.env.MONGODB_LOCKS_COLL || 'wa_instance_locks',
+      instanceId: process.env.BAILEYS_INSTANCE || 'default'
+    });
+    res.json({ success: true, lock: doc || null });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e?.message || String(e) });
+  }
 });
 
 // 🧹 Ruta para limpiar sesión con clave de acceso
@@ -242,15 +260,9 @@ app.get("/session-status/:accessKey", (req, res) => {
 app.get("/connection-diagnostics/:accessKey", (req, res) => {
   try {
     const { accessKey } = req.params;
-    
-    // Verificar clave de acceso
     const validAccessKey = process.env.SESSION_CLEAR_KEY || "default-clear-key-12345";
-    
     if (accessKey !== validAccessKey) {
-      return res.status(401).json({
-        success: false,
-        message: "❌ Clave de acceso inválida"
-      });
+      return res.status(401).json({ success: false, message: "❌ Clave de acceso inválida" });
     }
 
     const diagnostics = {
@@ -259,11 +271,8 @@ app.get("/connection-diagnostics/:accessKey", (req, res) => {
         isConnected: isConnected(),
         hasSocket: !!sock,
         hasUser: !!sock?.user,
-        userInfo: sock?.user ? {
-          id: sock.user.id,
-          name: sock.user.name
-        } : null,
-        readyState: sock?.readyState || 'N/A'
+        userInfo: sock?.user ? { id: sock.user.id, name: sock.user.name } : null,
+        readyState: sock?.ws?.readyState ?? 'N/A'
       },
       session: {
         qrAvailable: !!qrDinamic,
@@ -282,23 +291,14 @@ app.get("/connection-diagnostics/:accessKey", (req, res) => {
         macErrorCount: global.macErrorCount || 0
       },
       healthChecks: {
-        lastHealthLog: global.lastHealthLog || null,
-        healthCheckActive: !!connectionHealthInterval
+        lastHealthLog: null,
+        healthCheckActive: false
       }
     };
 
-    res.status(200).json({
-      success: true,
-      message: "📊 Diagnóstico de conexión",
-      diagnostics
-    });
-
+    res.status(200).json({ success: true, message: "📊 Diagnóstico de conexión", diagnostics });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "❌ Error obteniendo diagnóstico",
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: "❌ Error obteniendo diagnóstico", error: error.message });
   }
 });
 
@@ -310,6 +310,90 @@ let soket;
 let messageStore = {};
 let contactStore = {};
 let chatStore = {};
+
+async function ensureSingleInstanceLock() {
+  const leaseMs = parseInt(process.env.LOCK_LEASE_MS || '60000', 10);
+  const renewMs = parseInt(process.env.LOCK_RENEW_MS || '30000', 10);
+  const instanceId = process.env.BAILEYS_INSTANCE || 'default';
+  const mongoUrl = process.env.MONGO_URI;
+  const dbName = process.env.MONGODB_DB || 'baileysss';
+
+  if (!mongoUrl) {
+    console.error('❌ MONGO_URI no definido. Revisa tu .env');
+    process.exit(1);
+  }
+
+  try {
+    const lock = await initInstanceLock({
+      mongoUrl,
+      dbName,
+      collectionName: process.env.MONGODB_LOCKS_COLL || 'wa_instance_locks',
+      instanceId,
+      leaseMs,
+      renewEveryMs: renewMs,
+      meta: { processArgv: process.argv.slice(0, 3).join(' ') }
+    });
+    instanceLockRelease = lock.release;
+    console.log(`🔒 Lock adquirido para instanceId="${instanceId}" por ${lock.info.ownerId}`);
+  } catch (e) {
+    console.log("⚠️ No se pudo obtener el lock:", e?.message || e);
+    try {
+      const doc = await getActiveLockInfo({
+        mongoUrl,
+        dbName,
+        collectionName: process.env.MONGODB_LOCKS_COLL || 'wa_instance_locks',
+        instanceId
+      });
+      if (doc) {
+        console.log(`👀 Lock actual:
+  instanceId: ${doc.instanceId}
+  ownerId: ${doc.ownerId}
+  acquiredAt: ${doc.acquiredAt}
+  expiresAt: ${doc.expiresAt}
+  meta: ${JSON.stringify(doc.meta || {}, null, 2)}
+`);
+      } else {
+        console.log("ℹ️ No hay lock activo.");
+      }
+    } catch (infoErr) {
+      console.log("⚠️ No se pudo consultar lock actual:", infoErr?.message || infoErr);
+    }
+    // Salir para no correr dos instancias
+    process.exit(1);
+  }
+}
+
+
+// Liberar lock al salir
+for (const sig of ['SIGINT','SIGTERM','SIGHUP','SIGBREAK']) {
+  process.on(sig, async () => {
+    try { await instanceLockRelease?.(); } catch (_) {}
+    process.exit(0);
+  });
+}
+
+async function getAuthStateWithRetry() {
+  const max = 5;
+  let lastErr;
+  for (let i = 0; i < max; i++) {
+    try {
+      return await useMongoAuthState({
+        mongoUrl: process.env.MONGO_URI,
+        dbName: process.env.MONGODB_DB || 'baileysss',
+        collectionNamePrefix: process.env.MONGODB_COLLECTION_PREFIX || 'waAuthh',
+        instanceId: process.env.BAILEYS_INSTANCE || 'default'
+      });
+    } catch (err) {
+      lastErr = err;
+      const msg = err?.message || '';
+      if (!/querySrv|ETIMEOUT|ENOTFOUND|EAI_AGAIN/i.test(msg)) throw err;
+      const delay = Math.min(30000, 2000 * (i + 1));
+      console.log(`⚠️ Mongo DNS error (${msg}). Reintentando en ${Math.round(delay/1000)}s...`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
 
 // Función para crear el store de Baileys
 const initStore = () => {
@@ -345,7 +429,7 @@ const setUserState = (jid, state, data = {}) => {
   // Crear nuevo timeout
   const timeout = setTimeout(() => {
     clearUserState(jid);
-    sock.sendMessage(jid, {
+    safeSendMessage(jid, {
       text: "⏰ El flujo se ha cancelado por inactividad (3 minutos). Envía un nuevo comprobante para comenzar nuevamente."
     }).catch(console.error);
   }, TIMEOUT_DURATION);
@@ -378,51 +462,50 @@ const clearUserState = (jid) => {
 // Función para limpiar sesiones corruptas
 // Mejorar la función clearCorruptedSession
 const clearCorruptedSession = async () => {
-  try {
+try {
     console.log("🧹 Iniciando limpieza completa de sesión corrupta...");
-    
-    // 1. Cerrar conexión actual si existe
     if (sock) {
       try {
-        if (typeof sock.logout === 'function') {
-          await sock.logout();
-        } else if (typeof sock.end === 'function') {
-          sock.end();
-        }
+        if (typeof sock.logout === 'function') await sock.logout();
+        else if (typeof sock.end === 'function') sock.end();
       } catch (logoutError) {
         console.log("⚠️ Error en logout durante limpieza:", logoutError.message);
       }
     }
-    
-    // 2. Limpiar variables globales
+
     qrDinamic = null;
     sock = null;
-    
-    // 3. Limpiar carpeta de sesión
+
+    // Borrar storage local
     const sessionPath = path.join(__dirname, "session_auth_info");
     if (fs.existsSync(sessionPath)) {
       console.log("🗑️ Eliminando carpeta de sesión...");
       fs.rmSync(sessionPath, { recursive: true, force: true });
       console.log("✅ Carpeta de sesión eliminada");
     }
-
-    // 4. Limpiar store de Baileys
     const storePath = path.join(__dirname, "baileys_store.json");
     if (fs.existsSync(storePath)) {
       fs.unlinkSync(storePath);
       console.log("✅ Store de Baileys limpiado");
     }
-    
-    // 5. Limpiar state map de usuarios
+
+    // Borrar estado en Mongo (crítico para 428)
+    await clearMongoAuthState({
+      mongoUrl: process.env.MONGO_URI,
+      dbName: process.env.MONGODB_DB || 'baileysss',
+      collectionNamePrefix: process.env.MONGODB_COLLECTION_PREFIX || 'waAuthh',
+      instanceId: process.env.BAILEYS_INSTANCE || 'default'
+    });
+
     stateMap.clear();
     console.log("✅ Estados de usuarios limpiados");
-    
-    // 6. Resetear contadores
+
     global.reconnectAttempts = 0;
     global.macErrorCount = 0;
-    
+
+    if (soket) updateQR("qr"); // mostrar QR tras limpiar
     console.log("✅ Limpieza completa terminada - Se requerirá nuevo QR");
-    
+
   } catch (error) {
     console.error("❌ Error en limpieza de sesión:", error.message);
   }
@@ -477,33 +560,85 @@ const handleSessionError = async (error) => {
   return true; // Otros errores pueden requerir reconexión
 };
 
+const isSocketReady = () => {
+  if (!sock) return false;
+  const wsState = sock.ws?.readyState;
+  if (typeof wsState === 'number') return wsState === 1; // OPEN
+  // Fallback: si hay user, asumimos utilizable para enviar
+  return !!sock.user;
+};
+
+const safeSendMessage = async (jid, content, options) => {
+  const s = sock; // snapshot
+  if (!s || typeof s.sendMessage !== 'function') {
+    console.log("⚠️ No se envía: socket no inicializado");
+    return;
+  }
+  try {
+    await s.sendMessage(jid, content, options);
+  } catch (err) {
+    const msg = err?.message || String(err);
+    console.log("❌ sendMessage falló:", msg);
+    if (msg.includes('Connection Closed') || msg.includes('not connected')) {
+      // Reconexión suave si realmente está cerrado
+      scheduleReconnect(5000);
+    }
+  }
+};
+
+
+let isConnecting = false;
+let reconnectTimer = null;
+
+const scheduleReconnect = (ms = 5000) => {
+  if (reconnectTimer) return; // ya hay una programada
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    try {
+      await connectToWhatsApp();
+    } catch (e) {
+      console.log("⚠️ Error al reconectar:", e.message);
+    }
+  }, ms);
+};
+
 async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState("session_auth_info");
+
+  if (isConnecting) {
+    console.log("⏳ Ya hay una conexión en curso");
+  // si ya está abierto, no abras otra
+    return;
+  }
+  if (sock && sock.ws && sock.ws.readyState === 1) {
+    console.log("✅ Socket ya conectado");
+    return;
+  }
+  isConnecting = true;
+
+    try {
+
+      if (sock) {
+      try { sock.ev.removeAllListeners(); } catch (_) {}
+      try { sock.ws?.close(); } catch (_) {}
+    }
+
+        const { state, saveCreds /*, close*/ } = await getAuthStateWithRetry();
 
   sock = makeWASocket({
-    auth: state,
-    logger: log({ level: "silent" }),
-    syncFullHistory: false, // ⚠️ CRÍTICO: Mantener en false para evitar errores MAC
-    markOnlineOnConnect: false,
-    browser: Browsers.windows("Desktop"),
-    // 🛡️ CONFIGURACIONES OPTIMIZADAS PARA REDUCIR ERRORES MAC
-    retryRequestDelayMs: 5000, // 5 segundos entre reintentos
-    maxMsgRetryCount: 1, // Solo 1 reintento para evitar loops
-    fireInitQueries: false, // ⚠️ CRÍTICO: Deshabilitar queries iniciales
-    emitOwnEvents: false,
-    markOnlineOnConnect: false,
-    printQRInTerminal: false,
-    // 🔧 TIMEOUTS OPTIMIZADOS
-    connectTimeoutMs: 30000, // 30 segundos
-    defaultQueryTimeoutMs: 20000, // 20 segundos
-    keepAliveIntervalMs: 60000, // 1 minuto keep alive
-    // 🛡️ MANEJO DE ERRORES DE DESCIFRADO
-    // getMessage: async (key) => {
-    //   // No intentar recuperar mensajes que causan errores MAC
-    //   return undefined;
-    // },
-    // Reducir caché de contactos
-  });
+      auth: state,
+      logger: log({ level: "silent" }),
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      browser: Browsers.windows("Desktop"),
+      retryRequestDelayMs: 5000,
+      maxMsgRetryCount: 1,
+      fireInitQueries: false,
+      emitOwnEvents: false,
+      printQRInTerminal: false,
+      connectTimeoutMs: 30000,
+      defaultQueryTimeoutMs: 20000,
+      keepAliveIntervalMs: 60000,
+    });
 
   // Vincular el store al socket si está disponible
   if (store) {
@@ -565,10 +700,13 @@ async function connectToWhatsApp() {
       try {
         if (!msg.message || !msg.key?.remoteJid) continue;
 
-        const jid = msg.key.remoteJid;
+        const jid = msg?.key?.remoteJid;
+        const messageId = msg?.key?.id;
+        if (!jid || !messageId) {
+          console.log("⚠️ Mensaje sin jid/id, ignorando");
+          return;
+        }
         console.log(`🔍 Mensaje recibido de: ${jid}`);
-
-        const messageId = msg.key.id;
         const senderName = contactStore[jid]?.name || jid.split("@")[0];
         const messageType = getContentType(msg.message);
         
@@ -732,7 +870,7 @@ async function connectToWhatsApp() {
             }
           } else {
             // Si el usuario tiene un estado activo pero envía algo inesperado
-            await sock.sendMessage(jid, {
+            await safeSendMessage(jid, {
               text: "⚠️ Tienes un flujo activo. Responde a la pregunta anterior o espera 3 minutos para que se cancele automáticamente."
             });
           }
@@ -755,6 +893,297 @@ async function connectToWhatsApp() {
       }
     }
   });
+
+  sock.ev.on("connection.update", async (update) => {
+  const { connection, lastDisconnect, qr } = update;
+  qrDinamic = qr;
+  
+  if (connection === "close") {
+    let reason = new Boom(lastDisconnect?.error).output.statusCode;
+    let shouldReconnect = true;
+    let reconnectDelay = 5000;
+    let shouldCleanSession = false; // 🆕 Flag específico para limpieza
+    
+    console.log(`🔍 Conexión cerrada - Código: ${reason} | Error: ${lastDisconnect?.error?.message || 'Desconocido'}`);
+    
+    switch (reason) {
+      // 🚫 ERRORES QUE REQUIEREN LIMPIEZA DE SESIÓN (CRÍTICOS)
+      case DisconnectReason.badSession:
+        console.log("❌ Sesión corrupta detectada - REQUIERE limpieza");
+        shouldCleanSession = true;
+        shouldReconnect = true;
+        reconnectDelay = 5000;
+        break;
+        
+      case 428:
+  console.log("🚫 Error 428: Connection Terminated - Sesión inválida detectada - REQUIERE limpieza");
+  shouldCleanSession = true;
+  shouldReconnect = true;
+  reconnectDelay = 10000;
+
+  // Notificación (rate limited 30 min)
+  if (!global.last428NotifyAt || Date.now() - global.last428NotifyAt > 30 * 60 * 1000) {
+    const notifyJid = process.env.MY_NUMBER || process.env.NUMBER_1_ALLOWED;
+    if (notifyJid) {
+      await safeSendMessage(notifyJid, {
+        text: "⚠️ La sesión de WhatsApp del bot fue invalidada (428). Se requerirá reescanear el QR en /scan."
+      });
+      global.last428NotifyAt = Date.now();
+    }
+  }
+  break;
+
+      // 🔄 ERRORES QUE NO REQUIEREN LIMPIEZA (TEMPORALES O EXTERNOS)
+       case 440:
+  console.log("🔄 Error 440: Conflict - Otra instancia activa detectada");
+  console.log("⚠️ NO limpiando sesión - solo esperando a que la otra instancia se desconecte");
+  shouldCleanSession = false;
+  shouldReconnect = true;
+  reconnectDelay = 30000;
+
+  // Depuración: ¿quién tiene el lock ahora?
+  try {
+    const doc = await getActiveLockInfo({
+      mongoUrl: process.env.MONGO_URI,
+      dbName: process.env.MONGODB_DB || 'baileysss',
+      collectionName: process.env.MONGODB_LOCKS_COLL || 'wa_instance_locks',
+      instanceId: process.env.BAILEYS_INSTANCE || 'default'
+    });
+    if (doc) {
+      console.log(`👤 Lock holder:
+  ownerId: ${doc.ownerId}
+  acquiredAt: ${doc.acquiredAt}
+  expiresAt: ${doc.expiresAt}
+  meta: ${JSON.stringify(doc.meta || {}, null, 2)}
+`);
+    } else {
+      console.log("ℹ️ No se encontró lock activo (posible expiración).");
+    }
+  } catch (e) {
+    console.log("⚠️ No se pudo consultar lock holder:", e?.message || e);
+  }
+  break;
+        
+      case DisconnectReason.connectionReplaced:
+        console.log("🔄 Conexión reemplazada por otra sesión");
+        console.log("⚠️ NO limpiando sesión - puede ser temporal");
+        shouldCleanSession = false;
+        shouldReconnect = true;
+        reconnectDelay = 60000; // Esperar 1 minuto antes de intentar reconectar
+        break;
+        
+      case 401:
+        console.log("🚪 Error 401: Intentional Logout");
+        console.log("⚠️ NO limpiando sesión automáticamente - puede ser temporal");
+        shouldCleanSession = false;
+        shouldReconnect = true;
+        reconnectDelay = 45000; // Esperar 45 segundos
+        
+        // 🧠 SOLO limpiar si hay múltiples intentos fallidos
+        if (!global.logoutAttempts) global.logoutAttempts = 0;
+        global.logoutAttempts++;
+        
+        if (global.logoutAttempts > 5) {
+          console.log("🚨 Múltiples errores 401 - ahora SÍ limpiando sesión");
+          shouldCleanSession = true;
+          global.logoutAttempts = 0;
+        } else {
+          console.log(`🔄 Intento ${global.logoutAttempts}/5 - preservando sesión`);
+        }
+        break;
+
+      case DisconnectReason.loggedOut:
+        console.log("🚪 Sesión cerrada remotamente");
+        console.log("⚠️ Evaluando si realmente necesita limpieza...");
+        
+        // Solo limpiar si hay evidencia de que la sesión está corrupta
+        if (!global.remoteLogoutAttempts) global.remoteLogoutAttempts = 0;
+        global.remoteLogoutAttempts++;
+        
+        if (global.remoteLogoutAttempts > 3) {
+          console.log("🚨 Múltiples remote logouts - limpiando sesión");
+          shouldCleanSession = true;
+          global.remoteLogoutAttempts = 0;
+        } else {
+          console.log(`🔄 Remote logout ${global.remoteLogoutAttempts}/3 - preservando sesión`);
+          shouldCleanSession = false;
+        }
+        
+        shouldReconnect = true;
+        reconnectDelay = 20000;
+        break;
+        
+      // 🔄 ERRORES DE RED/TEMPORALES (NO REQUIEREN LIMPIEZA)
+      case DisconnectReason.connectionClosed:
+        console.log("🔌 Conexión cerrada por el servidor - NO limpiando sesión");
+        shouldCleanSession = false;
+        shouldReconnect = true;
+        reconnectDelay = 5000;
+        break;
+        
+      case DisconnectReason.connectionLost:
+        console.log("📶 Conexión perdida - NO limpiando sesión");
+        shouldCleanSession = false;
+        shouldReconnect = true;
+        reconnectDelay = 8000;
+        break;
+        
+      case DisconnectReason.timedOut:
+        console.log("⏰ Timeout de conexión - NO limpiando sesión");
+        shouldCleanSession = false;
+        shouldReconnect = true;
+        reconnectDelay = 15000;
+        break;
+        
+      case DisconnectReason.restartRequired:
+        console.log("🔄 WhatsApp requiere reinicio - NO limpiando sesión");
+        shouldCleanSession = false;
+        shouldReconnect = true;
+        reconnectDelay = 3000;
+        break;
+        
+      // 🌐 ERRORES DE SERVIDOR (NO REQUIEREN LIMPIEZA)
+      case 503:
+        console.log("🌐 Error 503: Stream Errored - problema temporal del servidor");
+        shouldCleanSession = false;
+        shouldReconnect = true;
+        reconnectDelay = 20000;
+        break;
+        
+      case 500:
+        console.log("⚠️ Error 500: Error interno del servidor WhatsApp");
+        shouldCleanSession = false;
+        shouldReconnect = true;
+        reconnectDelay = 25000;
+        break;
+        
+      case 408:
+        console.log("⏰ Error 408: Request Timeout");
+        shouldCleanSession = false;
+        shouldReconnect = true;
+        reconnectDelay = 12000;
+        break;
+        
+      case 429:
+        console.log("🚫 Error 429: Rate Limited - esperando más tiempo...");
+        shouldCleanSession = false;
+        shouldReconnect = true;
+        reconnectDelay = 90000; // 1.5 minutos para rate limiting
+        break;
+        
+      default:
+        console.log(`❓ Código de desconexión desconocido: ${reason}`);
+        console.log(`📋 Error completo: ${lastDisconnect?.error?.message || 'Sin detalles'}`);
+        
+        // 🧠 ANÁLISIS INTELIGENTE DEL ERROR
+        const errorMessage = lastDisconnect?.error?.message || '';
+        shouldCleanSession = false; // Por defecto NO limpiar
+        
+        if (errorMessage.includes('Bad MAC')) {
+          console.log("🔐 Error de MAC detectado - SÍ limpiando sesión");
+          shouldCleanSession = true;
+          reconnectDelay = 8000;
+        } else if (errorMessage.includes('Stream Errored')) {
+          console.log("🌊 Error de stream - NO limpiando sesión");
+          reconnectDelay = 20000;
+        } else if (errorMessage.includes('timeout')) {
+          console.log("⏰ Timeout detectado - NO limpiando sesión");
+          reconnectDelay = 15000;
+        } else if (errorMessage.includes('network') || errorMessage.includes('ECONNRESET')) {
+          console.log("📶 Error de red - NO limpiando sesión");
+          reconnectDelay = 10000;
+        } else {
+          console.log("❓ Error no identificado - NO limpiando sesión por precaución");
+          reconnectDelay = 30000;
+        }
+        
+        shouldReconnect = true;
+        break;
+    }
+    
+    // 🧹 LIMPIAR SESIÓN SOLO SI ES ABSOLUTAMENTE NECESARIO
+    if (shouldCleanSession) {
+          console.log("🚨 LIMPIEZA DE SESIÓN REQUERIDA - procediendo...");
+          await clearCorruptedSession();
+        } else {
+          console.log("✅ SESIÓN PRESERVADA - no se anula 'sock'");
+          // Importante: no hagas sock = null aquí
+        }
+
+        if (connectionHealthInterval) {
+          clearInterval(connectionHealthInterval);
+          connectionHealthInterval = null;
+        }
+    
+    // 🔄 EJECUTAR RECONEXIÓN SI ES NECESARIA
+    if (shouldReconnect) {
+          if (!global.reconnectAttempts) global.reconnectAttempts = 0;
+          global.reconnectAttempts++;
+
+          if (global.reconnectAttempts > 15) {
+            console.log("🛑 Demasiados intentos de reconexión - pausando por 10 minutos");
+            setTimeout(() => {
+              global.reconnectAttempts = 0;
+              console.log("🔄 Reiniciando contador de intentos, intentando reconectar...");
+              connectToWhatsApp().catch(err => console.log("Error en reconexión:", err?.message));
+            }, 600000);
+            return;
+          }
+
+          console.log(`🔄 Intento ${global.reconnectAttempts}/15 - Reconectando en ${reconnectDelay/1000} segundos...`);
+          if (soket) updateQR(shouldCleanSession ? "loading" : "connecting");
+
+          setTimeout(async () => {
+            try {
+              console.log("🚀 Iniciando reconexión automática...");
+              await connectToWhatsApp();
+            } catch (reconnectError) {
+              console.error("❌ Error en reconexión automática:", reconnectError?.message);
+            }
+          }, reconnectDelay);
+        } else {
+          console.log("🛑 Reconexión automática deshabilitada para este tipo de error");
+        }
+    
+  } else if (connection === "open") {
+    console.log("✅ Conexión WhatsApp establecida exitosamente");
+    
+    // Resetear TODOS los contadores al conectar exitosamente
+    global.reconnectAttempts = 0;
+    global.logoutAttempts = 0;
+    global.remoteLogoutAttempts = 0;
+    
+    // startConnectionHealthCheck();
+    global.macErrorCount = 0;
+    global.lastMacErrorReset = Date.now();
+    
+    if (soket) {
+      updateQR("connected");
+    }
+    
+    if (sock?.user) {
+      console.log(`👤 Usuario conectado: ${sock.user.name} (${sock.user.id})`);
+    }
+    
+  } else if (connection === "connecting") {
+    console.log("🔄 Conectando a WhatsApp...");
+    if (soket) {
+      updateQR("loading");
+    }
+  }
+});
+
+  sock.ev.on("creds.update", saveCreds);
+    } catch (error) {
+      console.log("❌ Error en connectToWhatsApp:", error?.message || error);
+  if (process.env.NODE_ENV === 'development' && error?.stack) {
+    console.log(error.stack);
+  };
+    } finally {
+    isConnecting = false;
+  }
+
+
 
   // 🔄 FUNCIONES DE MANEJO DE FLUJO CONVERSACIONAL
 
@@ -885,7 +1314,7 @@ Responde únicamente con el JSON, sin texto adicional.
         });
 
         // Enviar pregunta de confirmación con lista numerada
-        await sock.sendMessage(jid, {
+        await safeSendMessage(jid, {
           text: `✅ El destinatario es *${destinatarioMatch.clave}*\n\n¿Es correcto?\n\n1. Sí\n2. No\n3. Cancelar\n\nEscribe el número de tu opción:`
         }, { quoted: quotedMsg });
 
@@ -897,7 +1326,7 @@ Responde únicamente con el JSON, sin texto adicional.
 
     } catch (error) {
       console.error("❌ Error con OpenAI:", error.message);
-      await sock.sendMessage(jid, {
+      await safeSendMessage(jid, {
         text: "Ocurrió un error interpretando el mensaje."
       }, { quoted: quotedMsg });
     }
@@ -918,7 +1347,7 @@ Responde únicamente con el JSON, sin texto adicional.
         originalData: structuredData
       });
 
-      await sock.sendMessage(jid, {
+      await safeSendMessage(jid, {
         text: `🔍 Segundo intento: El destinatario es *${destinatarioFromCaption.clave}*\n\n¿Es correcto?\n\n1. Sí\n2. No\n3. Cancelar\n\nEscribe el número de tu opción:`
       }, { quoted: quotedMsg });
     } else {
@@ -937,7 +1366,7 @@ Responde únicamente con el JSON, sin texto adicional.
       originalData: structuredData
     });
 
-    await sock.sendMessage(jid, {
+    await safeSendMessage(jid, {
       text: "🆕 Vamos a crear un nuevo destinatario.\n\nEscribe el nombre canónico del destinatario:"
     });
   };
@@ -947,7 +1376,7 @@ Responde únicamente con el JSON, sin texto adicional.
     const option = parseInt(textMessage.trim());
     
     if (isNaN(option) || option < 1 || option > 3) {
-      await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
+      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
       return;
     }
 
@@ -959,7 +1388,7 @@ Responde únicamente con el JSON, sin texto adicional.
         await trySecondDestinatarioMatch(jid, userState.data.caption, userState.data.structuredData, quotedMsg);
         break;
       case 3: // Cancelar
-        await sock.sendMessage(jid, { text: "❌ Operación cancelada." });
+        await safeSendMessage(jid, { text: "❌ Operación cancelada." });
         clearUserState(jid);
         break;
     }
@@ -970,7 +1399,7 @@ Responde únicamente con el JSON, sin texto adicional.
     const option = parseInt(textMessage.trim());
     
     if (isNaN(option) || option < 1 || option > 3) {
-      await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
+      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
       return;
     }
 
@@ -982,7 +1411,7 @@ Responde únicamente con el JSON, sin texto adicional.
         await showAllDestinatariosList(jid, userState.data.structuredData);
         break;
       case 3: // Cancelar
-        await sock.sendMessage(jid, { text: "❌ Operación cancelada." });
+        await safeSendMessage(jid, { text: "❌ Operación cancelada." });
         clearUserState(jid);
         break;
     }
@@ -1001,13 +1430,13 @@ Responde únicamente con el JSON, sin texto adicional.
 
       if (error) {
         console.error("Error obteniendo destinatarios:", error);
-        await sock.sendMessage(jid, { text: "❌ Error obteniendo la lista de destinatarios." });
+        await safeSendMessage(jid, { text: "❌ Error obteniendo la lista de destinatarios." });
         clearUserState(jid);
         return;
       }
 
       if (!allDestinatarios || allDestinatarios.length === 0) {
-        await sock.sendMessage(jid, { text: "📋 No hay destinatarios registrados. Procederemos a crear uno nuevo." });
+        await safeSendMessage(jid, { text: "📋 No hay destinatarios registrados. Procederemos a crear uno nuevo." });
         await startNewDestinatarioFlow(jid, structuredData);
         return;
       }
@@ -1025,13 +1454,13 @@ Responde únicamente con el JSON, sin texto adicional.
         originalData: structuredData
       });
 
-      await sock.sendMessage(jid, {
+      await safeSendMessage(jid, {
         text: `📋 *Lista completa de destinatarios:*\n\n${destinatarioList}\nEscribe el número del destinatario que corresponde:`
       });
 
     } catch (error) {
       console.error("Error en showAllDestinatariosList:", error);
-      await sock.sendMessage(jid, { text: "❌ Error mostrando la lista de destinatarios." });
+      await safeSendMessage(jid, { text: "❌ Error mostrando la lista de destinatarios." });
       clearUserState(jid);
     }
   };
@@ -1044,7 +1473,7 @@ Responde únicamente con el JSON, sin texto adicional.
   const maxOption = allMetodosPago.length + 1; // +1 por la opción "crear nuevo"
 
   if (isNaN(option) || option < 0 || option > maxOption) {
-    await sock.sendMessage(jid, { 
+    await safeSendMessage(jid, { 
       text: `⚠️ Por favor, escribe un número válido (0 a ${maxOption}).` 
     });
     return;
@@ -1052,7 +1481,7 @@ Responde únicamente con el JSON, sin texto adicional.
 
   if (option === 0) {
     // Cancelar
-    await sock.sendMessage(jid, { text: "❌ Operación cancelada." });
+    await safeSendMessage(jid, { text: "❌ Operación cancelada." });
     clearUserState(jid);
     return;
   }
@@ -1071,7 +1500,7 @@ Responde únicamente con el JSON, sin texto adicional.
 
     await proceedToFinalConfirmationWithMetodoPago(jid, selectedMetodoPago.name, userState.data.structuredData);
   } else {
-    await sock.sendMessage(jid, { text: "⚠️ Opción no válida. Intenta nuevamente." });
+    await safeSendMessage(jid, { text: "⚠️ Opción no válida. Intenta nuevamente." });
   }
 };
 
@@ -1081,7 +1510,7 @@ const startNewMetodoPagoFlow = async (jid, structuredData) => {
     originalData: structuredData
   });
 
-  await sock.sendMessage(jid, {
+  await safeSendMessage(jid, {
     text: "💳 Vamos a crear un nuevo método de pago.\n\nEscribe el nombre del nuevo método de pago:"
   });
 };
@@ -1091,7 +1520,7 @@ const handleNewMetodoPagoName = async (jid, textMessage, userState, quotedMsg) =
   const nombreMetodoPago = textMessage.trim();
   
   if (!nombreMetodoPago) {
-    await sock.sendMessage(jid, { text: "⚠️ Por favor, ingresa un nombre válido." });
+    await safeSendMessage(jid, { text: "⚠️ Por favor, ingresa un nombre válido." });
     return;
   }
 
@@ -1099,12 +1528,12 @@ const handleNewMetodoPagoName = async (jid, textMessage, userState, quotedMsg) =
   const newMetodoPago = await saveNewMetodoPago(nombreMetodoPago);
 
   if (!newMetodoPago) {
-    await sock.sendMessage(jid, { text: "❌ Error guardando el método de pago. Intenta más tarde." });
+    await safeSendMessage(jid, { text: "❌ Error guardando el método de pago. Intenta más tarde." });
     clearUserState(jid);
     return;
   }
 
-  await sock.sendMessage(jid, { 
+  await safeSendMessage(jid, { 
     text: `✅ Método de pago *${nombreMetodoPago}* creado exitosamente.` 
   });
 
@@ -1159,7 +1588,7 @@ const saveNewMetodoPago = async (name) => {
       finalStructuredData: finalData
     });
 
-    await sock.sendMessage(jid, {
+    await safeSendMessage(jid, {
       text: `📋 *Datos del comprobante:*\n\n` +
       `👤 *Destinatario:* ${finalData.nombre}\n` +
       `💰 *Monto:* $${finalData.monto || 'No especificado'}\n` +
@@ -1180,7 +1609,7 @@ const saveNewMetodoPago = async (name) => {
     const isModification = userState.data.isModification || false;
 
     if (isNaN(option) || option < 0 || option > maxOption) {
-      await sock.sendMessage(jid, { 
+      await safeSendMessage(jid, { 
         text: `⚠️ Por favor, escribe un número válido (0 a ${maxOption}).` 
       });
       return;
@@ -1191,7 +1620,7 @@ const saveNewMetodoPago = async (name) => {
         if (isModification) {
           await proceedToFinalConfirmationFromModification(jid, userState.data.finalStructuredData);
         } else {
-          await sock.sendMessage(jid, { text: "❌ Operación cancelada." });
+          await safeSendMessage(jid, { text: "❌ Operación cancelada." });
           clearUserState(jid);
         }
         break;
@@ -1220,14 +1649,14 @@ const saveNewMetodoPago = async (name) => {
               nuevo: selectedDestinatario.name,
               updatedData: updatedData
             });
-            await sock.sendMessage(jid, { text: `✅ Destinatario actualizado a: ${selectedDestinatario.name}` });
+            await safeSendMessage(jid, { text: `✅ Destinatario actualizado a: ${selectedDestinatario.name}` });
             await proceedToFinalConfirmationFromModification(jid, updatedData);
           } else {
             // Flujo normal
             await proceedToFinalConfirmation(jid, selectedDestinatario.name, userState.data.structuredData);
           }
         } else {
-          await sock.sendMessage(jid, { text: "⚠️ Opción no válida. Intenta nuevamente." });
+          await safeSendMessage(jid, { text: "⚠️ Opción no válida. Intenta nuevamente." });
         }
         break;
     }
@@ -1238,7 +1667,7 @@ const saveNewMetodoPago = async (name) => {
     const option = parseInt(textMessage.trim());
     
     if (isNaN(option) || option < 1 || option > 3) {
-      await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
+      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
       return;
     }
 
@@ -1250,7 +1679,7 @@ const saveNewMetodoPago = async (name) => {
         await showModificationMenu(jid, userState.data);
         break;
       case 3: // Cancelar
-        await sock.sendMessage(jid, { text: "❌ Operación cancelada." });
+        await safeSendMessage(jid, { text: "❌ Operación cancelada." });
         clearUserState(jid);
         break;
     }
@@ -1263,7 +1692,7 @@ const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg)
   const nombreCanonico = textMessage.trim();
   
   if (!nombreCanonico) {
-    await sock.sendMessage(jid, { text: "⚠️ Por favor, ingresa un nombre válido." });
+    await safeSendMessage(jid, { text: "⚠️ Por favor, ingresa un nombre válido." });
     return;
   }
 
@@ -1277,7 +1706,7 @@ const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg)
     if (similarMatch.isExactMatch) {
       console.log(`🎯 Coincidencia exacta encontrada: ${similarMatch.destinatario.name} - usando automáticamente`);
       
-      await sock.sendMessage(jid, {
+      await safeSendMessage(jid, {
         text: `🎯 El destinatario "*${nombreCanonico}*" ya existe en el sistema.\n\n` +
         `✅ Se usará el destinatario existente: *${similarMatch.destinatario.name}*\n\n` +
         `💡 Se realizó una búsqueda en el sistema y se encontró una coincidencia exacta.`
@@ -1293,7 +1722,7 @@ const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg)
           nombre: similarMatch.destinatario.name
         };
         console.log('🔧 Destinatario exacto encontrado en modificación:', similarMatch.destinatario.name);
-        await sock.sendMessage(jid, { text: `✅ Destinatario actualizado a: ${similarMatch.destinatario.name}` });
+        await safeSendMessage(jid, { text: `✅ Destinatario actualizado a: ${similarMatch.destinatario.name}` });
         await proceedToFinalConfirmationFromModification(jid, updatedData);
       } else {
         // Flujo normal - proceder a verificar método de pago
@@ -1311,7 +1740,7 @@ const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg)
       destinatarioSimilar: similarMatch.destinatario
     });
     
-    await sock.sendMessage(jid, {
+    await safeSendMessage(jid, {
       text: `🔍 Revisando todo el listado de destinatarios, he encontrado uno parecido:\n\n` +
       `*${similarMatch.destinatario.name}*\n\n` +
       `¿Qué deseas hacer?\n\n` +
@@ -1332,7 +1761,7 @@ const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg)
     const option = parseInt(textMessage.trim());
     
     if (isNaN(option) || option < 1 || option > 3) {
-      await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
+      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
       return;
     }
 
@@ -1344,7 +1773,7 @@ const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg)
         await showAllMetodosPagoList(jid, userState.data.structuredData);
         break;
       case 3: // Cancelar
-        await sock.sendMessage(jid, { text: "❌ Operación cancelada." });
+        await safeSendMessage(jid, { text: "❌ Operación cancelada." });
         clearUserState(jid);
         break;
     }
@@ -1355,7 +1784,7 @@ const handleDestinatarioFuzzyConfirmation = async (jid, textMessage, userState, 
   const option = parseInt(textMessage.trim());
   
   if (isNaN(option) || option < 1 || option > 3) {
-    await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
+    await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
     return;
   }
 
@@ -1374,7 +1803,7 @@ const handleDestinatarioFuzzyConfirmation = async (jid, textMessage, userState, 
           nombre: destinatarioExistente.name
         };
         console.log('🔧 Destinatario existente seleccionado en modificación:', destinatarioExistente.name);
-        await sock.sendMessage(jid, { text: `✅ Destinatario actualizado a: ${destinatarioExistente.name}` });
+        await safeSendMessage(jid, { text: `✅ Destinatario actualizado a: ${destinatarioExistente.name}` });
         await proceedToFinalConfirmationFromModification(jid, updatedData);
       } else {
         // Flujo normal - proceder a verificar método de pago
@@ -1389,7 +1818,7 @@ const handleDestinatarioFuzzyConfirmation = async (jid, textMessage, userState, 
       break;
       
     case 3: // Cancelar
-      await sock.sendMessage(jid, { text: "❌ Operación cancelada." });
+      await safeSendMessage(jid, { text: "❌ Operación cancelada." });
       clearUserState(jid);
       break;
   }
@@ -1407,7 +1836,7 @@ const proceedToAliasesInput = async (jid, nombreCanonico, userData) => {
 
   setUserState(jid, STATES.AWAITING_DESTINATARIO_ALIASES, updatedData);
 
-  await sock.sendMessage(jid, {
+  await safeSendMessage(jid, {
     text: `✅ Nombre guardado: *${nombreCanonico}*\n\n` +
     `📝 Ahora, si deseas puedes agregar "seudónimos" para *${nombreCanonico}*, escribe los nombres separados por una coma, sigue el siguiente ejemplo:\n\n` +
     `*Nombre canónico:* Confitería Alamos\n` +
@@ -1437,7 +1866,7 @@ const handleDestinatarioAliases = async (jid, textMessage, userState, quotedMsg)
     .filter(alias => alias.length > 0);
   
   if (aliases.length === 0) {
-    await sock.sendMessage(jid, { 
+    await safeSendMessage(jid, { 
       text: "⚠️ No se detectaron aliases válidos. Separa los nombres con comas o escribe 'skip' para continuar sin aliases." 
     });
     return;
@@ -1469,7 +1898,7 @@ const handleDestinatarioAliases = async (jid, textMessage, userState, quotedMsg)
   
   responseMessage += "Continuando con las categorías...";
   
-  await sock.sendMessage(jid, { text: responseMessage });
+  await safeSendMessage(jid, { text: responseMessage });
   
   // Proceder a selección de categoría con solo los aliases válidos
   await proceedToCategorySelection(jid, userState.data, validAliases);
@@ -1482,7 +1911,7 @@ const handleDestinatarioAliases = async (jid, textMessage, userState, quotedMsg)
     const metodosPago = await getMetodosPago();
 
     if (metodosPago.length === 0) {
-      await sock.sendMessage(jid, { text: "❌ No hay métodos de pago registrados en el sistema." });
+      await safeSendMessage(jid, { text: "❌ No hay métodos de pago registrados en el sistema." });
       clearUserState(jid);
       return;
     }
@@ -1500,13 +1929,13 @@ const handleDestinatarioAliases = async (jid, textMessage, userState, quotedMsg)
       originalData: structuredData
     });
 
-    await sock.sendMessage(jid, {
+    await safeSendMessage(jid, {
       text: `💳 *Lista completa de métodos de pago:*\n\n${metodosList}\nEscribe el número del método de pago que corresponde:`
     });
 
   } catch (error) {
     console.error("Error en showAllMetodosPagoList:", error);
-    await sock.sendMessage(jid, { text: "❌ Error mostrando la lista de métodos de pago." });
+    await safeSendMessage(jid, { text: "❌ Error mostrando la lista de métodos de pago." });
     clearUserState(jid);
   }
 };
@@ -1526,7 +1955,7 @@ const proceedToCategorySelection = async (jid, userData, aliases) => {
   const categorias = await getCategorias();
   
   if (categorias.length === 0) {
-    await sock.sendMessage(jid, { text: "❌ No se pudieron cargar las categorías. Intenta más tarde." });
+    await safeSendMessage(jid, { text: "❌ No se pudieron cargar las categorías. Intenta más tarde." });
     clearUserState(jid);
     return;
   }
@@ -1543,7 +1972,7 @@ const proceedToCategorySelection = async (jid, userData, aliases) => {
   };
   setUserState(jid, STATES.AWAITING_CATEGORY_SELECTION, updatedDataWithCategories);
 
-  await sock.sendMessage(jid, {
+  await safeSendMessage(jid, {
     text: `📂 Elige una categoría escribiendo el número:\n\n${categoryList}\n\nEscribe solo el número de la categoría que deseas.`
   });
 };
@@ -1553,13 +1982,13 @@ const proceedToCategorySelection = async (jid, userData, aliases) => {
     const categoryNumber = parseInt(textMessage.trim());
     
     if (isNaN(categoryNumber) || categoryNumber < 1) {
-      await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe un número válido de la lista." });
+      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido de la lista." });
       return;
     }
 
     const categories = userState.data.availableCategories;
     if (!categories || categoryNumber > categories.length) {
-      await sock.sendMessage(jid, { text: "⚠️ Número fuera de rango. Elige un número de la lista." });
+      await safeSendMessage(jid, { text: "⚠️ Número fuera de rango. Elige un número de la lista." });
       return;
     }
 
@@ -1574,13 +2003,13 @@ const proceedToCategorySelection = async (jid, userData, aliases) => {
     const subcategoryNumber = parseInt(textMessage.trim());
     
     if (isNaN(subcategoryNumber) || subcategoryNumber < 1) {
-      await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe un número válido de la lista." });
+      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido de la lista." });
       return;
     }
 
     const subcategories = userState.data.availableSubcategories;
     if (!subcategories || subcategoryNumber > subcategories.length) {
-      await sock.sendMessage(jid, { text: "⚠️ Número fuera de rango. Elige un número de la lista." });
+      await safeSendMessage(jid, { text: "⚠️ Número fuera de rango. Elige un número de la lista." });
       return;
     }
 
@@ -1595,7 +2024,7 @@ const proceedToCategorySelection = async (jid, userData, aliases) => {
     const subcategorias = await getSubcategorias(categoriaId);
     
     if (subcategorias.length === 0) {
-      await sock.sendMessage(jid, { text: "⚠️ No hay subcategorías disponibles para esta categoría." });
+      await safeSendMessage(jid, { text: "⚠️ No hay subcategorías disponibles para esta categoría." });
       return;
     }
 
@@ -1612,7 +2041,7 @@ const proceedToCategorySelection = async (jid, userData, aliases) => {
       `${index + 1}. ${subcat.name}`
     ).join('\n');
 
-    await sock.sendMessage(jid, {
+    await safeSendMessage(jid, {
       text: `� Ahora elige una subcategoría escribiendo el número:\n\n${subcategoryList}\n\nEscribe solo el número de la subcategoría que deseas.`
     });
   };
@@ -1628,7 +2057,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
   );
 
   if (!newDestinatario) {
-    await sock.sendMessage(jid, { text: "❌ Error guardando el destinatario. Intenta más tarde." });
+    await safeSendMessage(jid, { text: "❌ Error guardando el destinatario. Intenta más tarde." });
     clearUserState(jid);
     return;
   }
@@ -1647,7 +2076,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     }
   }
 
-  await sock.sendMessage(jid, { 
+  await safeSendMessage(jid, { 
     text: `✅ Destinatario *${userData.newDestinatarioName}* creado exitosamente${userData.destinatarioAliases?.length ? ` con ${userData.destinatarioAliases.length} seudónimos` : ''}.` 
   });
 
@@ -1691,7 +2120,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
       });
 
       // Enviar pregunta de confirmación
-      await sock.sendMessage(jid, {
+      await safeSendMessage(jid, {
         text: `💳 El método de pago es *${metodoPagoMatch.name}*\n\n¿Es correcto?\n\n1. Sí\n2. No\n3. Cancelar\n\nEscribe el número de tu opción:`
       });
 
@@ -1707,11 +2136,11 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     try {
       const result = await saveDataFirstFlow(userData.finalStructuredData);
       if (result.success) {
-        await sock.sendMessage(jid, { 
+        await safeSendMessage(jid, { 
           text: "✅ Comprobante guardado exitosamente." 
         });
       } else {
-        await sock.sendMessage(jid, { 
+        await safeSendMessage(jid, { 
           text: "❌ Error guardando el comprobante. Intenta más tarde." 
         });
       }
@@ -1719,7 +2148,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
       clearUserState(jid);
     } catch (error) {
       console.error("Error guardando comprobante:", error);
-      await sock.sendMessage(jid, { 
+      await safeSendMessage(jid, { 
         text: "❌ Error guardando el comprobante." 
       });
       clearUserState(jid);
@@ -1730,7 +2159,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
   const showModificationMenu = async (jid, userData) => {
     setUserState(jid, STATES.AWAITING_MODIFICATION_SELECTION, userData);
 
-    await sock.sendMessage(jid, {
+    await safeSendMessage(jid, {
       text: `📝 ¿Qué deseas modificar?\n\n` +
       `0. ❌ Cancelar\n` +
       `1. 👤 Destinatario\n` +
@@ -1747,7 +2176,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     const option = parseInt(textMessage.trim());
     
     if (isNaN(option) || option < 0 || option > 5) {
-      await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (0 a 5)." });
+      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (0 a 5)." });
       return;
     }
 
@@ -1760,19 +2189,19 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
         break;
       case 2: // Monto
         setUserState(jid, STATES.AWAITING_MONTO_MODIFICATION, userState.data);
-        await sock.sendMessage(jid, {
+        await safeSendMessage(jid, {
           text: "💰 Escribe el nuevo monto (solo números, sin puntos, sin comas, sin símbolos):\n\nEjemplo: 14935\n\nEscribe 0 para cancelar."
         });
         break;
       case 3: // Fecha
         setUserState(jid, STATES.AWAITING_FECHA_MODIFICATION, userState.data);
-        await sock.sendMessage(jid, {
+        await safeSendMessage(jid, {
           text: "📅 Escribe la nueva fecha en formato dd/mm/yyyy:\n\nEjemplo: 15/08/2025\n\nEscribe 0 para cancelar."
         });
         break;
       case 4: // Tipo de movimiento
         setUserState(jid, STATES.AWAITING_TIPO_MOVIMIENTO_MODIFICATION, userState.data);
-        await sock.sendMessage(jid, {
+        await safeSendMessage(jid, {
           text: "📊 Escribe el tipo de movimiento:\n\n1. ingreso\n2. egreso\n\nEscribe 0 para cancelar."
         });
         break;
@@ -1792,13 +2221,13 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
 
       if (error) {
         console.error("Error obteniendo destinatarios:", error);
-        await sock.sendMessage(jid, { text: "❌ Error obteniendo la lista de destinatarios." });
+        await safeSendMessage(jid, { text: "❌ Error obteniendo la lista de destinatarios." });
         await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
         return;
       }
 
       if (!allDestinatarios || allDestinatarios.length === 0) {
-        await sock.sendMessage(jid, { text: "📋 No hay destinatarios registrados." });
+        await safeSendMessage(jid, { text: "📋 No hay destinatarios registrados." });
         await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
         return;
       }
@@ -1814,13 +2243,13 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
         isModification: true
       });
 
-      await sock.sendMessage(jid, {
+      await safeSendMessage(jid, {
         text: `👤 *Selecciona el nuevo destinatario:*\n\n${destinatarioList}\nEscribe el número del destinatario:`
       });
 
     } catch (error) {
       console.error("Error en showDestinatariosForModification:", error);
-      await sock.sendMessage(jid, { text: "❌ Error mostrando destinatarios." });
+      await safeSendMessage(jid, { text: "❌ Error mostrando destinatarios." });
       await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
     }
   };
@@ -1831,7 +2260,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     const metodosPago = await getMetodosPago();
     
     if (metodosPago.length === 0) {
-      await sock.sendMessage(jid, { text: "❌ No se pudieron cargar los métodos de pago." });
+      await safeSendMessage(jid, { text: "❌ No se pudieron cargar los métodos de pago." });
       await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
       return;
     }
@@ -1846,13 +2275,13 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
       availableMetodosPago: metodosPago
     });
 
-    await sock.sendMessage(jid, {
+    await safeSendMessage(jid, {
       text: `💳 *Selecciona el nuevo método de pago:*\n\n${metodosList}\nEscribe el número del método de pago:`
     });
 
   } catch (error) {
     console.error("Error en showMediosPagoForModification:", error);
-    await sock.sendMessage(jid, { text: "❌ Error mostrando métodos de pago." });
+    await safeSendMessage(jid, { text: "❌ Error mostrando métodos de pago." });
     await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
   }
 };
@@ -1868,7 +2297,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
 
     const monto = parseFloat(input);
     if (isNaN(monto) || monto <= 0) {
-      await sock.sendMessage(jid, { text: "⚠️ Por favor, ingresa un monto válido (solo números)." });
+      await safeSendMessage(jid, { text: "⚠️ Por favor, ingresa un monto válido (solo números)." });
       return;
     }
 
@@ -1878,7 +2307,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
       monto: monto
     };
 
-    await sock.sendMessage(jid, { text: `✅ Monto actualizado a: $${monto}` });
+    await safeSendMessage(jid, { text: `✅ Monto actualizado a: $${monto}` });
     await proceedToFinalConfirmationFromModification(jid, updatedData);
   };
 
@@ -1894,7 +2323,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     // Validar formato dd/mm/yyyy
     const fechaRegex = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/;
     if (!fechaRegex.test(input)) {
-      await sock.sendMessage(jid, { text: "⚠️ Formato incorrecto. Usa dd/mm/yyyy (ej: 15/08/2025)" });
+      await safeSendMessage(jid, { text: "⚠️ Formato incorrecto. Usa dd/mm/yyyy (ej: 15/08/2025)" });
       return;
     }
 
@@ -1904,7 +2333,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
       fecha: input
     };
 
-    await sock.sendMessage(jid, { text: `✅ Fecha actualizada a: ${input}` });
+    await safeSendMessage(jid, { text: `✅ Fecha actualizada a: ${input}` });
     await proceedToFinalConfirmationFromModification(jid, updatedData);
   };
 
@@ -1918,7 +2347,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     }
 
     if (isNaN(option) || option < 1 || option > 2) {
-      await sock.sendMessage(jid, { text: "⚠️ Por favor, escribe 1 (ingreso), 2 (egreso) o 0 (cancelar)." });
+      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe 1 (ingreso), 2 (egreso) o 0 (cancelar)." });
       return;
     }
 
@@ -1930,7 +2359,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
       tipo_movimiento: tipoMovimiento
     };
 
-    await sock.sendMessage(jid, { text: `✅ Tipo de movimiento actualizado a: ${tipoMovimiento}` });
+    await safeSendMessage(jid, { text: `✅ Tipo de movimiento actualizado a: ${tipoMovimiento}` });
     await proceedToFinalConfirmationFromModification(jid, updatedData);
   };
 
@@ -1947,7 +2376,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
   const maxOption = metodosPago.length + 1; // +1 por la opción "crear nuevo"
 
   if (isNaN(option) || option < 1 || option > maxOption) {
-    await sock.sendMessage(jid, { 
+    await safeSendMessage(jid, { 
       text: `⚠️ Por favor, escribe un número válido (0 a ${maxOption}).` 
     });
     return;
@@ -1962,7 +2391,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
       originalData: userState.data.finalStructuredData
     });
 
-    await sock.sendMessage(jid, {
+    await safeSendMessage(jid, {
       text: "💳 Vamos a crear un nuevo método de pago.\n\nEscribe el nombre del nuevo método de pago:"
     });
     return;
@@ -1976,7 +2405,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     medio_pago: selectedMetodo.name
   };
 
-  await sock.sendMessage(jid, { text: `✅ Método de pago actualizado a: ${selectedMetodo.name}` });
+  await safeSendMessage(jid, { text: `✅ Método de pago actualizado a: ${selectedMetodo.name}` });
   await proceedToFinalConfirmationFromModification(jid, updatedData);
 };
 
@@ -1988,7 +2417,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
       finalStructuredData: finalData
     });
 
-    await sock.sendMessage(jid, {
+    await safeSendMessage(jid, {
       text: `📋 *Datos del comprobante (actualizados):*\n\n` +
       `👤 *Destinatario:* ${finalData.nombre || 'No especificado'}\n` +
       `💰 *Monto:* $${finalData.monto || 'No especificado'}\n` +
@@ -2000,263 +2429,8 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     });
   };
 
-
-  let connectionHealthInterval = null;
-
-const startConnectionHealthCheck = () => {
-  // Limpiar interval anterior si existe
-  if (connectionHealthInterval) {
-    clearInterval(connectionHealthInterval);
-  }
-  
-  connectionHealthInterval = setInterval(async () => {
-    try {
-      if (!sock || !sock.user) {
-        console.log("⚠️ Health check: Socket no conectado");
-        return;
-      }
-      
-      // Test básico de conectividad
-      const timestamp = Date.now();
-      const healthCheckPassed = sock.user && sock.readyState === 1; // WebSocket OPEN
-      
-      if (!healthCheckPassed) {
-        console.log("🚨 Health check falló - conexión inestable detectada");
-        console.log("🔄 Iniciando reconexión preventiva...");
-        
-        // Reconexión preventiva
-        setTimeout(() => {
-          connectToWhatsApp().catch(err => {
-            console.log("⚠️ Error en reconexión preventiva:", err.message);
-          });
-        }, 5000);
-      } else {
-        // Solo mostrar health check cada 10 minutos para no hacer spam
-        if (!global.lastHealthLog || timestamp - global.lastHealthLog > 600000) {
-          console.log("💚 Health check: Conexión estable");
-          global.lastHealthLog = timestamp;
-        }
-      }
-      
-    } catch (error) {
-      console.log("⚠️ Error en health check:", error.message);
-    }
-  }, 120000); // Cada 2 minutos
-};
-
   // Reemplazar el event handler connection.update (línea ~1800)
-sock.ev.on("connection.update", async (update) => {
-  const { connection, lastDisconnect, qr } = update;
-  qrDinamic = qr;
-  
-  if (connection === "close") {
-    let reason = new Boom(lastDisconnect?.error).output.statusCode;
-    let shouldReconnect = true;
-    let reconnectDelay = 5000; // 5 segundos por defecto
-    
-    console.log(`🔍 Conexión cerrada - Código: ${reason} | Error: ${lastDisconnect?.error?.message || 'Desconocido'}`);
-    
-    switch (reason) {
 
-       case 428:
-        console.log("🚫 Error 428: Connection Terminated - Sesión inválida detectada");
-        console.log("🧹 La sesión actual no es válida, requiere limpieza completa");
-        
-        // Limpiar sesión automáticamente
-        await clearCorruptedSession();
-        
-        // Detener el bucle de reconexión infinito
-        shouldReconnect = true;
-        reconnectDelay = 10000; // 10 segundos para dar tiempo a que se complete la limpieza
-        
-        // Limpiar variables globales inmediatamente
-        qrDinamic = null;
-        sock = null;
-        
-        // Mostrar mensaje de que necesita escanear QR nuevamente
-        console.log("📱 Será necesario escanear un nuevo código QR");
-        
-        if (soket) {
-          updateQR("loading");
-        }
-        break;
-
-      case DisconnectReason.badSession:
-        console.log("❌ Sesión corrupta detectada");
-        console.log(`🧹 Limpiando sesión ${session} y requiriendo nuevo escaneo`);
-        await clearCorruptedSession();
-        shouldReconnect = true;
-        reconnectDelay = 3000;
-        break;
-        
-      case DisconnectReason.connectionClosed:
-        console.log("🔌 Conexión cerrada por el servidor");
-        shouldReconnect = true;
-        reconnectDelay = 3000;
-        break;
-        
-      case DisconnectReason.connectionLost:
-        console.log("📶 Conexión perdida - reconectando...");
-        shouldReconnect = true;
-        reconnectDelay = 5000;
-        break;
-        
-      case DisconnectReason.connectionReplaced:
-        console.log("🔄 Conexión reemplazada por otra sesión");
-        console.log("⚠️ Otra instancia del bot está activa - cerrando esta sesión");
-        shouldReconnect = false;
-        try {
-          sock?.logout();
-        } catch (logoutError) {
-          console.log("⚠️ Error en logout:", logoutError.message);
-        }
-        break;
-        
-      case DisconnectReason.loggedOut:
-        console.log("🚪 Sesión cerrada remotamente");
-        console.log(`🧹 Limpiando sesión ${session} y requiriendo nuevo escaneo`);
-        await clearCorruptedSession();
-        shouldReconnect = true;
-        reconnectDelay = 3000;
-        break;
-        
-      case DisconnectReason.restartRequired:
-        console.log("🔄 WhatsApp requiere reinicio de sesión");
-        shouldReconnect = true;
-        reconnectDelay = 2000;
-        break;
-        
-      case DisconnectReason.timedOut:
-        console.log("⏰ Timeout de conexión - reconectando...");
-        shouldReconnect = true;
-        reconnectDelay = 10000; // 10 segundos para timeouts
-        break;
-        
-      // 🆕 MANEJO ESPECÍFICO PARA ERRORES 503 Y OTROS CÓDIGOS
-      case 503:
-        console.log("🌐 Error 503: Stream Errored (problema temporal del servidor)");
-        console.log("🔄 Implementando estrategia de reconexión gradual...");
-        shouldReconnect = true;
-        reconnectDelay = 15000; // 15 segundos para errores 503
-        break;
-        
-      case 500:
-        console.log("⚠️ Error 500: Error interno del servidor WhatsApp");
-        shouldReconnect = true;
-        reconnectDelay = 20000; // 20 segundos para errores internos
-        break;
-        
-      case 408:
-        console.log("⏰ Error 408: Request Timeout");
-        shouldReconnect = true;
-        reconnectDelay = 10000;
-        break;
-        
-      case 429:
-        console.log("🚫 Error 429: Rate Limited - esperando más tiempo...");
-        shouldReconnect = true;
-        reconnectDelay = 60000; // 1 minuto para rate limiting
-        break;
-        
-      default:
-        console.log(`❓ Código de desconexión desconocido: ${reason}`);
-        console.log(`📋 Error completo: ${lastDisconnect?.error?.message || 'Sin detalles'}`);
-        
-        // 🧠 ANÁLISIS INTELIGENTE DEL ERROR
-        const errorMessage = lastDisconnect?.error?.message || '';
-        
-        if (errorMessage.includes('Stream Errored')) {
-          console.log("🌊 Detectado error de stream - aplicando reconexión robusta");
-          shouldReconnect = true;
-          reconnectDelay = 15000;
-        } else if (errorMessage.includes('Bad MAC')) {
-          console.log("🔐 Error de MAC detectado - limpiando sesión");
-          await clearCorruptedSession();
-          shouldReconnect = true;
-          reconnectDelay = 5000;
-        } else if (errorMessage.includes('timeout')) {
-          console.log("⏰ Timeout detectado en mensaje de error");
-          shouldReconnect = true;
-          reconnectDelay = 10000;
-        } else if (errorMessage.includes('network') || errorMessage.includes('ECONNRESET')) {
-          console.log("📶 Error de red detectado");
-          shouldReconnect = true;
-          reconnectDelay = 8000;
-        } else {
-          // Error completamente desconocido - intentar reconectar con delay largo
-          console.log("❓ Error no identificado - reconectando con precaución");
-          shouldReconnect = true;
-          reconnectDelay = 30000; // 30 segundos para errores desconocidos
-        }
-        break;
-    }
-    
-    // 🔄 EJECUTAR RECONEXIÓN SI ES NECESARIA
-    if (shouldReconnect) {
-      // Implementar contador de intentos para evitar bucle infinito
-      if (!global.reconnectAttempts) global.reconnectAttempts = 0;
-      global.reconnectAttempts++;
-      
-      if (global.reconnectAttempts > 10) {
-        console.log("🛑 Demasiados intentos de reconexión - pausando por 5 minutos");
-        setTimeout(() => {
-          global.reconnectAttempts = 0;
-          console.log("🔄 Reiniciando contador de intentos, intentando reconectar...");
-          connectToWhatsApp().catch(err => console.log("Error en reconexión:", err.message));
-        }, 300000); // 5 minutos
-        return;
-      }
-      
-      console.log(`🔄 Intento ${global.reconnectAttempts}/10 - Programando reconexión en ${reconnectDelay/1000} segundos...`);
-      
-      // Limpiar variables globales antes de reconectar
-      qrDinamic = null;
-      sock = null;
-      
-      // Actualizar UI
-      if (soket) {
-        updateQR("loading");
-      }
-      
-      setTimeout(async () => {
-        try {
-          console.log("🚀 Iniciando reconexión automática...");
-          await connectToWhatsApp();
-        } catch (reconnectError) {
-          console.error("❌ Error en reconexión automática:", reconnectError.message);
-        }
-      }, reconnectDelay);
-    } else {
-      console.log("🛑 Reconexión automática deshabilitada para este tipo de error");
-    }
-    
-} else if (connection === "open") {
-    console.log("✅ Conexión WhatsApp establecida exitosamente");
-    
-    // Resetear contador de intentos al conectar exitosamente
-    global.reconnectAttempts = 0;
-    
-    startConnectionHealthCheck();
-    global.macErrorCount = 0;
-    global.lastMacErrorReset = Date.now();
-    
-    if (soket) {
-      updateQR("connected");
-    }
-    
-    if (sock?.user) {
-      console.log(`👤 Usuario conectado: ${sock.user.name} (${sock.user.id})`);
-    }
-    
-  } else if (connection === "connecting") {
-    console.log("🔄 Conectando a WhatsApp...");
-    if (soket) {
-      updateQR("loading");
-    }
-  }
-});
-
-  sock.ev.on("creds.update", saveCreds);
 
   // sock.ev.on(
   //   "messaging-history.set",
@@ -2280,6 +2454,7 @@ sock.ev.on("connection.update", async (update) => {
   //   }
   // );
 }
+
 
 
 
@@ -2955,7 +3130,7 @@ const startApp = async () => {
   try {
     console.log("🚀 Iniciando WhatsApp Bot con OCR y OpenAI...");
     console.log("⚠️ Los errores 'Bad MAC' son normales durante la conexión inicial");
-    
+     await ensureSingleInstanceLock();
     // Verificar variables de entorno (sin detener la ejecución)
     if (!process.env.OPENAI_API_KEY) {
       console.warn("⚠️ OPENAI_API_KEY no configurada - IA deshabilitada");
