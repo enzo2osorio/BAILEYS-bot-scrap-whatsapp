@@ -1110,10 +1110,6 @@ async function connectToWhatsApp() {
           // Importante: no hagas sock = null aquí
         }
 
-        if (connectionHealthInterval) {
-          clearInterval(connectionHealthInterval);
-          connectionHealthInterval = null;
-        }
     
     // 🔄 EJECUTAR RECONEXIÓN SI ES NECESARIA
     if (shouldReconnect) {
