@@ -1,6 +1,5 @@
 const supabase = require("./supabase");
 
-
 function toTimestampFromPayload({ fecha, hora, fecha_iso }) {
   if (typeof fecha_iso === 'string' && !Number.isNaN(Date.parse(fecha_iso))) {
     return new Date(fecha_iso);
@@ -22,60 +21,65 @@ function toTimestampFromPayload({ fecha, hora, fecha_iso }) {
   return new Date(y, m - 1, d, hh, mm, 0, 0);
 }
 
-const pad2 = (n) => String(n).padStart(2, '0');
-
 async function saveDataFirstFlow(params) {
-   
-    const {nombre:nombre_destino, monto, fecha, hora, tipo_movimiento, medio_pago, observacion} = params
- 
+  const {
+    nombre: nombre_destino,
+    monto,
+    fecha,
+    hora,
+    fecha_iso,
+    tipo_movimiento,
+    medio_pago,
+    observacion
+  } = params;
 
-    const {data: existingDestinatario, error} = await supabase
-                                        .from("destinatarios")
-                                        .select("*")
-                                        .eq('name', nombre_destino);
-                          
-    console.log("Destinatario encontrado:", existingDestinatario);
+  // Destinatario
+  const { data: existingDestinatario, error: errDest } = await supabase
+    .from("destinatarios")
+    .select("*")
+    .eq("name", nombre_destino);
 
-   if(!existingDestinatario || existingDestinatario.length === 0){
-    return {error: "No existe el destinatario."};
-   }
+  if (errDest) return { error: "Error consultando destinatario." };
+  if (!existingDestinatario || existingDestinatario.length === 0) {
+    return { error: "No existe el destinatario." };
+  }
+  const destinatario = existingDestinatario[0];
 
-   const {data: existingMedioPago, error: errorMedioPago} = await supabase
-                                        .from("metodos_pago")
-                                        .select("*")
-                                        .eq('name', medio_pago)
-                                        .single();
+  // Método de pago
+  const { data: existingMedioPago, error: errMedio } = await supabase
+    .from("metodos_pago")
+    .select("*")
+    .eq("name", medio_pago)
+    .single();
 
-   if(!existingMedioPago){
-    return {error: "No existe el medio de pago."};
-    }
+  if (errMedio || !existingMedioPago) {
+    return { error: "No existe el medio de pago." };
+  }
 
+  // Fecha/timestamp seguro
+  const ts = toTimestampFromPayload({ fecha, hora, fecha_iso });
 
-   const ts = toTimestampFromPayload(payload);
-   // Tomar el primer destinatario del array
-   const destinatario = existingDestinatario[0];
+  // Insertar registro
+  const { data: dataRegistro, error: errorRegistro } = await supabase
+    .from("registros")
+    .insert({
+      destinatario_id: destinatario.id,
+      monto: monto != null ? Number(monto) : null,
+      fecha: ts.toISOString(), // timestamptz
+      tipo_movimiento,
+      metodo_pago_id: existingMedioPago.id,
+      descripcion: observacion ?? null,
+      created_at: new Date().toISOString()
+    })
+    .select()
+    .single();
 
-   const {data : dataRegistro, error: errorRegistro} = await supabase.
-                                        from("registros").
-                                        insert(
-                                            {
-                                                destinatario_id: destinatario.id,
-                                                monto,
-                                                fecha: ts,
-                                                tipo_movimiento,
-                                                metodo_pago_id: existingMedioPago.id,
-                                                descripcion: observacion,
-                                                created_at: new Date().toISOString()
-                                            }
-                                        )
+  if (errorRegistro) {
+    console.log({ errorRegistro });
+    return { error: "Error al guardar el registro." };
+  }
 
-
-   if(errorRegistro){
-    console.log({errorRegistro})
-       return {error: "Error al guardar el registro."};
-   }
-
-   return {success : true, data: dataRegistro}; // Retorna el registro guardado o un mensaje de éxito
-}  
+  return { success: true, data: dataRegistro };
+}
 
 module.exports = saveDataFirstFlow;
