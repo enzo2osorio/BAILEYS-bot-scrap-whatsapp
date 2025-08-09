@@ -3,6 +3,7 @@
 const { MongoClient } = require('mongodb');
 const os = require('os');
 const { randomUUID } = require('crypto');
+const { getDb } = require('../db/mongo');
 
 const DEFAULT_COLL = 'wa_instance_locks';
 
@@ -131,13 +132,23 @@ async function initInstanceLock({
   return { release, info: { instanceId, ownerId, meta: baseMeta } };
 }
 
-async function getActiveLockInfo({ mongoUrl, dbName, collectionName = DEFAULT_COLL, instanceId = 'default' }) {
-  const { client, coll } = await getColl(mongoUrl, dbName, collectionName);
-  try {
-    return await coll.findOne({ instanceId });
-  } finally {
-    await client.close().catch(() => {});
-  }
+async function getActiveLockInfo({ collectionName = process.env.MONGODB_LOCKS_COLL || 'wa_instance_locks', instanceId = 'default' }) {
+  const db = await getDb();
+  const coll = db.collection(collectionName);
+  return await coll.findOne({ instanceId, expiresAt: { $gt: new Date() } });
 }
 
-module.exports = { initInstanceLock, getActiveLockInfo };
+async function setLock({ collectionName = process.env.MONGODB_LOCKS_COLL || 'wa_instance_locks', instanceId = 'default', ownerId, ttlMs = 60000, meta = {} }) {
+  const db = await getDb();
+  const coll = db.collection(collectionName);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + ttlMs);
+  await coll.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {}); // TTL
+  return await coll.updateOne(
+    { instanceId },
+    { $set: { instanceId, ownerId, acquiredAt: now, expiresAt, meta } },
+    { upsert: true }
+  );
+}
+
+module.exports = { initInstanceLock, getActiveLockInfo, setLock };
