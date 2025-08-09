@@ -3,7 +3,7 @@
 const { MongoClient } = require('mongodb');
 const os = require('os');
 const { randomUUID } = require('crypto');
-const { getDb } = require('../db/mongo');
+const { getDb } = require('./singleton-mongo');
 
 const DEFAULT_COLL = 'wa_instance_locks';
 
