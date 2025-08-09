@@ -1,5 +1,29 @@
 const supabase = require("./supabase");
 
+
+function toTimestampFromPayload({ fecha, hora, fecha_iso }) {
+  if (typeof fecha_iso === 'string' && !Number.isNaN(Date.parse(fecha_iso))) {
+    return new Date(fecha_iso);
+  }
+  let d, m, y;
+  if (typeof fecha === 'string') {
+    const mres = fecha.match(/^\s*(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\s*$/);
+    if (mres) { d = parseInt(mres[1],10); m = parseInt(mres[2],10); y = parseInt(mres[3],10); }
+  }
+  const now = new Date();
+  if (d == null || m == null || y == null) {
+    d = now.getDate(); m = now.getMonth() + 1; y = now.getFullYear();
+  }
+  let hh = 0, mm = 0;
+  if (typeof hora === 'string') {
+    const hres = hora.match(/^\s*(\d{1,2}):(\d{2})\s*$/);
+    if (hres) { hh = Math.min(23, parseInt(hres[1],10)); mm = Math.min(59, parseInt(hres[2],10)); }
+  }
+  return new Date(y, m - 1, d, hh, mm, 0, 0);
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
 async function saveDataFirstFlow(params) {
    
     const {nombre:nombre_destino, monto, fecha, hora, tipo_movimiento, medio_pago, observacion} = params
@@ -27,13 +51,7 @@ async function saveDataFirstFlow(params) {
     }
 
 
-   // Convertir fecha de dd/mm/yyyy a yyyy-mm-dd para PostgreSQL
-   let fechaFormatted = null;
-   if (fecha) {
-     const [day, month, year] = fecha.split('/');
-     fechaFormatted = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
-   }
-
+   const ts = toTimestampFromPayload(payload);
    // Tomar el primer destinatario del array
    const destinatario = existingDestinatario[0];
 
@@ -43,7 +61,7 @@ async function saveDataFirstFlow(params) {
                                             {
                                                 destinatario_id: destinatario.id,
                                                 monto,
-                                                fecha: fechaFormatted,
+                                                fecha: ts,
                                                 tipo_movimiento,
                                                 metodo_pago_id: existingMedioPago.id,
                                                 descripcion: observacion,

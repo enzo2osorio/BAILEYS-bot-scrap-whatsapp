@@ -116,6 +116,7 @@ const qrcode = require("qrcode");
 const checkSimilarDestinatario = require("./utils/checkSimilarDestinatario.js");
 const saveDestinatarioAliases = require("./utils/saveDestinatarioAliases.js");
 const checkDuplicateAliases = require("./utils/checkDuplicateAliases.js");
+const { closeClient } = require("./utils/mongo/singleton-mongo.js");
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
 
@@ -986,27 +987,26 @@ const msgRetryCounterCache = new NodeCache();
   shouldReconnect = true;
   reconnectDelay = 30000;
 
+
   // Depuración: ¿quién tiene el lock ahora?
   try {
-    const doc = await getActiveLockInfo({
-      mongoUrl: process.env.MONGO_URI,
-      dbName: process.env.MONGODB_DB || 'baileysss',
-      collectionName: process.env.MONGODB_LOCKS_COLL || 'wa_instance_locks',
-      instanceId: process.env.BAILEYS_INSTANCE || 'default'
-    });
-    if (doc) {
-      console.log(`👤 Lock holder:
-  ownerId: ${doc.ownerId}
-  acquiredAt: ${doc.acquiredAt}
-  expiresAt: ${doc.expiresAt}
-  meta: ${JSON.stringify(doc.meta || {}, null, 2)}
+  const doc = await getActiveLockInfo({
+    instanceId: process.env.BAILEYS_INSTANCE || 'default'
+  });
+  if (doc) {
+    console.log(`👤 Lock holder:
+    
+ownerId: ${doc.ownerId}
+acquiredAt: ${doc.acquiredAt}
+expiresAt: ${doc.expiresAt}
+meta: ${JSON.stringify(doc.meta || {}, null, 2)}
 `);
-    } else {
-      console.log("ℹ️ No se encontró lock activo (posible expiración).");
-    }
-  } catch (e) {
-    console.log("⚠️ No se pudo consultar lock holder:", e?.message || e);
+  } else {
+    console.log("ℹ️ No se encontró lock activo (posible expiración).");
   }
+} catch (e) {
+  console.log("⚠️ No se pudo consultar lock holder:", e?.message || e);
+}
   break;
         
       case DisconnectReason.connectionReplaced:
@@ -1572,6 +1572,12 @@ const handleNewMetodoPagoName = async (jid, textMessage, userState, quotedMsg) =
   await safeSendMessage(jid, { 
     text: `✅ Método de pago *${nombreMetodoPago}* creado exitosamente.` 
   });
+
+  const graceful = async (signal) => {
+  console.log(`\n${signal} recibido. Cerrando conexiones Mongo...`);
+  await closeClient().catch(()=>{});
+  process.exit(0);
+};
 
   // Verificar si estamos en modo modificación
   const isModification = userState.data.isModification || userState.data.finalStructuredData;
@@ -2221,37 +2227,30 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
 
   // 💾 Guardar comprobante final
   const saveComprobante = async (jid, userData) => {
-    try {
+  try {
+    const normalized = normalizeDateTime(userData.finalStructuredData || {});
 
-      const normalized = normalizeDateTime(userData.finalStructuredData || {});
-
-      const payload = {
+    // Mantener compatibilidad: fecha (dd/mm/yyyy) y hora (HH:mm)
+    const payload = {
       ...normalized,
-      fecha: normalized.fecha_iso // <- para timestamptz
-      // Si tu columna es 'date', usa: fecha: normalized.fecha
+      fecha: normalized.fecha,      // dd/mm/yyyy (lo que espera saveDataFirstFlow)
+      hora: normalized.hora,        // HH:mm
+      fecha_iso: normalized.fecha_iso // opcional por si luego la usas como timestamptz
     };
-    delete payload.fecha_iso;
 
-      const result = await saveDataFirstFlow(payload);
-      if (result.success) {
-        await safeSendMessage(jid, { 
-          text: "✅ Comprobante guardado exitosamente." 
-        });
-      } else {
-        await safeSendMessage(jid, { 
-          text: "❌ Error guardando el comprobante. Intenta más tarde." 
-        });
-      }
-
-      clearUserState(jid);
-    } catch (error) {
-      console.error("Error guardando comprobante:", error);
-      await safeSendMessage(jid, { 
-        text: "❌ Error guardando el comprobante." 
-      });
-      clearUserState(jid);
+    const result = await saveDataFirstFlow(payload);
+    if (result.success) {
+      await safeSendMessage(jid, { text: "✅ Comprobante guardado exitosamente." });
+    } else {
+      await safeSendMessage(jid, { text: "❌ Error guardando el comprobante. Intenta más tarde." });
     }
-  };
+    clearUserState(jid);
+  } catch (error) {
+    console.error("Error guardando comprobante:", error);
+    await safeSendMessage(jid, { text: "❌ Error guardando el comprobante." });
+    clearUserState(jid);
+  }
+};
 
   // 📝 Mostrar menú de modificación
   const showModificationMenu = async (jid, userData) => {
@@ -3262,49 +3261,10 @@ const startApp = async () => {
   }
 };
 
-process.on('uncaughtException', (error) => {
-  // Filtrar errores MAC que no son críticos
-  if (error.message?.includes("Bad MAC") || 
-      error.message?.includes("Failed to decrypt") ||
-      error.message?.includes("Session error")) {
-    // Solo mostrar un resumen cada 30 segundos para evitar spam
-    if (!global.lastMacErrorLog || Date.now() - global.lastMacErrorLog > 30000) {
-      console.log("⚠️ Errores de descifrado detectados (normal durante sincronización inicial)");
-      global.lastMacErrorLog = Date.now();
-    }
-    return; // No cerrar la aplicación por errores MAC
-  }
-  
-  // Otros errores sí son críticos
-  console.error('❌ Error crítico no capturado:', error.message);
-  console.error('Stack:', error.stack);
-});
+['SIGINT','SIGTERM'].forEach(sig => process.on(sig, () => graceful(sig)));
 
-process.on('unhandledRejection', (reason, promise) => {
-  const errorMessage = reason?.message || reason;
-
-  if (typeof errorMessage === 'string') {
-    // Filtrar errores de sesión normales durante sincronización
-    if (errorMessage.includes("Bad MAC") || 
-        errorMessage.includes("Failed to decrypt") ||
-        errorMessage.includes("Session error")) {
-      return;
-    }
-    
-    // Filtrar errores de callback relacionados con protocolMessage
-    if (errorMessage.includes('The "cb" argument must be of type function') ||
-        errorMessage.includes('callback') && errorMessage.includes('undefined')) {
-      // Solo mostrar un resumen cada 30 segundos para evitar spam
-      if (!global.lastCallbackErrorLog || Date.now() - global.lastCallbackErrorLog > 30000) {
-        console.log("⚠️ Errores de callback detectados (probablemente protocolMessage) - filtrados");
-        global.lastCallbackErrorLog = Date.now();
-      }
-      return;
-    }
-  }
-  
-  console.error('❌ Promesa rechazada no manejada:', errorMessage);
-});
+process.on('uncaughtException', async (err) => { console.error(err); await closeClient(); process.exit(1); });
+process.on('unhandledRejection', async (err) => { console.error(err); await closeClient(); process.exit(1); });
 
 
 startApp();
