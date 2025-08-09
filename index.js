@@ -2,12 +2,14 @@ const {
   default: makeWASocket,
   DisconnectReason,
   makeInMemoryStore,
-  useMultiFileAuthState,
   downloadMediaMessage,
   getContentType,
   Browsers,
+  makeCacheableSignalKeyStore,
+  fetchLatestBaileysVersion,
 } = require("@whiskeysockets/baileys");
 const dns = require('dns');
+const NodeCache = require('node-cache'); // <- agregado
 dns.setDefaultResultOrder?.('ipv4first');
 const { useMongoAuthState, clearMongoAuthState } = require('./utils/mongo/mongo-adapter.js'); // <- usar nuestro adaptador
 const log = (pino = require("pino"));
@@ -32,7 +34,6 @@ const getSubcategorias = require('./utils/getSubcategorias.js');
 const getMetodosPago = require('./utils/getMetodosPago.js');
 const saveNewDestinatario = require('./utils/saveNewDestinatario.js');
 const matchMetodoPago = require('./utils/findMatchMetodoPago.js');
-const { startPeriodicCleanup } = require('./utils/cleanupSessionFiles.js');
 
 dotenv.config();
 
@@ -41,6 +42,38 @@ let instanceLockRelease = null;
 // 🔄 SISTEMA DE ESTADO PERSISTENTE POR USUARIO
 const stateMap = new Map();
 const TIMEOUT_DURATION = 3 * 60 * 1000; // 3 minutos en milisegundos
+// --- añadidos para control de envío inicial, keep-alive y reconexión simple ---
+let readyToSendAt = 0;             // ventana para retrasar el primer envío tras "open"
+let keepAliveTimer = null;       
+let WA_VERSION = null;
+let WA_IS_LATEST = false;
+let isConnecting = false;
+let reconnectTimer = null;
+
+
+const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+function startKeepAlive() {
+  clearInterval(keepAliveTimer);
+  const digits = (process.env.MY_NUMBER || process.env.NUMBER_1_ALLOWED || '').replace(/\D/g, '');
+  if (!digits) return;
+  const jid = `${digits}@s.whatsapp.net`;
+  keepAliveTimer = setInterval(async () => {
+    try {
+      if (!sock?.user) return;
+      await sock.onWhatsApp(jid);  // ping ligero, no notifica
+    } catch (_) { /* silencioso */ }
+  }, 10 * 60 * 1000); // cada 10 minutos
+}
+function stopKeepAlive() { clearInterval(keepAliveTimer); keepAliveTimer = null; }
+
+function scheduleReconnect(ms = 10000) {
+  if (isConnecting || reconnectTimer) return;
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    try { await connectToWhatsApp(); } catch (e) { /* logea adentro */ }
+  }, ms);
+}
 
 // Estados posibles del flujo
 const STATES = {
@@ -569,44 +602,39 @@ const isSocketReady = () => {
 };
 
 const safeSendMessage = async (jid, content, options) => {
-  const s = sock; // snapshot
+  // espera si aún no pasan los 30s de estabilización tras "open"
+  if (Date.now() < readyToSendAt) {
+    const wait = Math.max(0, readyToSendAt - Date.now());
+    if (wait > 0) await delay(wait);
+  }
+
+  const s = sock;
   if (!s || typeof s.sendMessage !== 'function') {
     console.log("⚠️ No se envía: socket no inicializado");
     return;
   }
   try {
-    await s.sendMessage(jid, content, options);
+    return await s.sendMessage(jid, content, options);
   } catch (err) {
-    const msg = err?.message || String(err);
-    console.log("❌ sendMessage falló:", msg);
-    if (msg.includes('Connection Closed') || msg.includes('not connected')) {
-      // Reconexión suave si realmente está cerrado
+    console.log("❌ sendMessage falló:", err?.message || String(err));
+    // reconexión simple si aplica
+    const msg = err?.message || '';
+    if (/Connection Closed|not connected|Restart Required/i.test(msg)) {
       scheduleReconnect(5000);
     }
   }
 };
 
 
-let isConnecting = false;
-let reconnectTimer = null;
 
-const scheduleReconnect = (ms = 5000) => {
-  if (reconnectTimer) return; // ya hay una programada
-  reconnectTimer = setTimeout(async () => {
-    reconnectTimer = null;
-    try {
-      await connectToWhatsApp();
-    } catch (e) {
-      console.log("⚠️ Error al reconectar:", e.message);
-    }
-  }, ms);
-};
+const P = require("pino")({
+  level: "silent",
+});
 
 async function connectToWhatsApp() {
 
   if (isConnecting) {
     console.log("⏳ Ya hay una conexión en curso");
-  // si ya está abierto, no abras otra
     return;
   }
   if (sock && sock.ws && sock.ws.readyState === 1) {
@@ -615,6 +643,11 @@ async function connectToWhatsApp() {
   }
   isConnecting = true;
 
+  clearTimeout(reconnectTimer); 
+reconnectTimer = null;
+
+const msgRetryCounterCache = new NodeCache();
+
     try {
 
       if (sock) {
@@ -622,14 +655,20 @@ async function connectToWhatsApp() {
       try { sock.ws?.close(); } catch (_) {}
     }
 
-        const { state, saveCreds /*, close*/ } = await getAuthStateWithRetry();
-
+    const { state, saveCreds /*, close*/ } = await getAuthStateWithRetry();
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+          WA_VERSION = version;
+          WA_IS_LATEST = isLatest;
   sock = makeWASocket({
-      auth: state,
+      auth: {
+         creds: state.creds,
+         keys: makeCacheableSignalKeyStore(state.keys, P),
+      },
+      version: WA_VERSION,
       logger: log({ level: "silent" }),
-      syncFullHistory: false,
       markOnlineOnConnect: false,
-      browser: Browsers.windows("Desktop"),
+      browser: Browsers.ubuntu("Chrome"),
+      syncFullHistory: false,
       retryRequestDelayMs: 5000,
       maxMsgRetryCount: 1,
       fireInitQueries: false,
@@ -638,6 +677,7 @@ async function connectToWhatsApp() {
       connectTimeoutMs: 30000,
       defaultQueryTimeoutMs: 20000,
       keepAliveIntervalMs: 60000,
+      msgRetryCounterCache,
     });
 
   // Vincular el store al socket si está disponible
@@ -664,6 +704,7 @@ async function connectToWhatsApp() {
   // 🛡️ AGREGAR MANEJO DE ERRORES GLOBAL PARA EL SOCKET
   sock.ev.on('error', async (error) => {
     // Filtrar errores MAC normales durante sincronización
+    
     if (error.message?.includes("Bad MAC") || 
         error.message?.includes("Failed to decrypt")) {
       // Solo log cada 30 segundos para evitar spam
@@ -686,9 +727,7 @@ async function connectToWhatsApp() {
     const needsReconnect = await handleSessionError(error);
     if (needsReconnect) {
       console.log("🔄 Error crítico detectado, programando reconexión...");
-      setTimeout(() => {
-        connectToWhatsApp().catch(err => console.log("Error en reconexión:", err));
-      }, 5000); // Esperar 5 segundos antes de reconectar
+      scheduleReconnect(5000);
     }
   });
 
@@ -899,7 +938,13 @@ async function connectToWhatsApp() {
   qrDinamic = qr;
   
   if (connection === "close") {
-    let reason = new Boom(lastDisconnect?.error).output.statusCode;
+     stopKeepAlive();
+    const err = lastDisconnect?.error;
+    const reason =
+      (err?.output?.statusCode) ??
+      (err?.data?.statusCode) ??
+      (err?.statusCode) ??
+      undefined;            
     let shouldReconnect = true;
     let reconnectDelay = 5000;
     let shouldCleanSession = false; // 🆕 Flag específico para limpieza
@@ -1103,47 +1148,42 @@ async function connectToWhatsApp() {
     
     // 🧹 LIMPIAR SESIÓN SOLO SI ES ABSOLUTAMENTE NECESARIO
     if (shouldCleanSession) {
-          console.log("🚨 LIMPIEZA DE SESIÓN REQUERIDA - procediendo...");
-          await clearCorruptedSession();
-        } else {
-          console.log("✅ SESIÓN PRESERVADA - no se anula 'sock'");
-          // Importante: no hagas sock = null aquí
-        }
+      console.log("🚨 LIMPIEZA DE SESIÓN REQUERIDA - procediendo...");
+      await clearCorruptedSession();
+    } else {
+      console.log("✅ SESIÓN PRESERVADA - no se anula 'sock'");
+    }
 
     
     // 🔄 EJECUTAR RECONEXIÓN SI ES NECESARIA
-    if (shouldReconnect) {
-          if (!global.reconnectAttempts) global.reconnectAttempts = 0;
-          global.reconnectAttempts++;
+     if (shouldReconnect) {
+      // elimina la llamada duplicada
+      // scheduleReconnect(10000);  // <- quitar
+      if (!global.reconnectAttempts) global.reconnectAttempts = 0;
+      global.reconnectAttempts++;
 
-          if (global.reconnectAttempts > 15) {
-            console.log("🛑 Demasiados intentos de reconexión - pausando por 10 minutos");
-            setTimeout(() => {
-              global.reconnectAttempts = 0;
-              console.log("🔄 Reiniciando contador de intentos, intentando reconectar...");
-              connectToWhatsApp().catch(err => console.log("Error en reconexión:", err?.message));
-            }, 600000);
-            return;
-          }
+      if (global.reconnectAttempts > 15) {
+        console.log("🛑 Demasiados intentos de reconexión - pausando por 10 minutos");
+        setTimeout(() => {
+          global.reconnectAttempts = 0;
+          console.log("🔄 Reiniciando contador de intentos, intentando reconectar...");
+          scheduleReconnect(0);         // <- usa scheduler
+        }, 600000);
+        return;
+      }
 
-          console.log(`🔄 Intento ${global.reconnectAttempts}/15 - Reconectando en ${reconnectDelay/1000} segundos...`);
-          if (soket) updateQR(shouldCleanSession ? "loading" : "connecting");
+      console.log(`🔄 Intento ${global.reconnectAttempts}/15 - Reconectando en ${Math.round(reconnectDelay/1000)} segundos...`);
+      if (soket) updateQR(shouldCleanSession ? "loading" : "connecting");
 
-          setTimeout(async () => {
-            try {
-              console.log("🚀 Iniciando reconexión automática...");
-              await connectToWhatsApp();
-            } catch (reconnectError) {
-              console.error("❌ Error en reconexión automática:", reconnectError?.message);
-            }
-          }, reconnectDelay);
-        } else {
-          console.log("🛑 Reconexión automática deshabilitada para este tipo de error");
-        }
+      scheduleReconnect(reconnectDelay); // <- una sola programación de reconexión
+    } else {
+      console.log("🛑 Reconexión automática deshabilitada para este tipo de error");
+    }
     
   } else if (connection === "open") {
-    console.log("✅ Conexión WhatsApp establecida exitosamente");
-    
+     readyToSendAt = Date.now() + 30000;
+        console.log(`✅ Conexión WhatsApp establecida. WA version=${WA_VERSION?.join('.')} isLatest=${WA_IS_LATEST}`);
+        startKeepAlive();
     // Resetear TODOS los contadores al conectar exitosamente
     global.reconnectAttempts = 0;
     global.logoutAttempts = 0;
@@ -1575,25 +1615,77 @@ const saveNewMetodoPago = async (name) => {
 };
 
   const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, structuredData) => {
-    const finalData = {
-      ...structuredData,
-      medio_pago: metodoPagoName
+  const finalData = normalizeDateTime({
+    ...structuredData,
+    medio_pago: metodoPagoName
+  });
+
+  setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
+    finalStructuredData: finalData
+  });
+
+  await safeSendMessage(jid, {
+    text: `📋 *Datos del comprobante:*\n\n` +
+    `👤 *Destinatario:* ${finalData.nombre}\n` +
+    `💰 *Monto:* $${finalData.monto || 'No especificado'}\n` +
+    `📅 *Fecha:* ${finalData.fecha || 'No especificada'}\n` +
+    `🕐 *Hora:* ${finalData.hora || 'No especificada'}\n` +
+    `📊 *Tipo:* ${finalData.tipo_movimiento || 'No especificado'}\n` +
+    `💳 *Método de pago:* ${finalData.medio_pago}\n\n` +
+    `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`
+  });
+};
+
+
+  const pad2 = (n) => String(n).padStart(2, '0');
+
+  const normalizeDateTime = (data) => {
+    // data.fecha: dd/mm/yyyy (opcional)
+    // data.hora:  HH:mm       (opcional)
+    const now = new Date();
+
+    // Parse fecha dd/mm/yyyy o dd-mm-yyyy
+    let d, m, y;
+    if (typeof data.fecha === 'string') {
+      const fm = data.fecha.match(/^\s*(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\s*$/);
+      if (fm) {
+        d = parseInt(fm[1], 10);
+        m = parseInt(fm[2], 10);
+        y = parseInt(fm[3], 10);
+      }
+    }
+    if (d == null || m == null || y == null) {
+      // si no hay fecha, usar hoy
+      d = now.getDate();
+      m = now.getMonth() + 1;
+      y = now.getFullYear();
+    }
+
+    // Parse hora HH:mm (si no hay, usar 00:00)
+    let hh = 0, mm = 0;
+    if (typeof data.hora === 'string') {
+      const hm = data.hora.match(/^\s*(\d{1,2}):(\d{2})\s*$/);
+      if (hm) {
+        hh = Math.min(23, parseInt(hm[1], 10));
+        mm = Math.min(59, parseInt(hm[2], 10));
+      } else if (!data.hora) {
+        // si hora está ausente explícitamente, dejaremos 00:00
+      }
+    } else if (data.hora) {
+      // si viene en otro formato no válido, también 00:00
+    }
+
+    const localDate = new Date(y, m - 1, d, hh, mm, 0, 0); // zona local del server
+    const fechaStr = `${pad2(d)}/${pad2(m)}/${y}`;
+    const horaStr = `${pad2(hh)}:${pad2(mm)}`;
+    const iso = localDate.toISOString(); // listo para timestamptz
+
+    return {
+      ...data,
+      fecha: fechaStr,
+      hora: horaStr,
+      fecha_iso: iso // para guardar en BD como timestamptz
     };
-
-    setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
-      finalStructuredData: finalData
-    });
-
-    await safeSendMessage(jid, {
-      text: `📋 *Datos del comprobante:*\n\n` +
-      `👤 *Destinatario:* ${finalData.nombre}\n` +
-      `💰 *Monto:* $${finalData.monto || 'No especificado'}\n` +
-      `📅 *Fecha:* ${finalData.fecha || 'No especificada'}\n` +
-      `🕐 *Hora:* ${finalData.hora || 'No especificada'}\n` +
-      `📊 *Tipo:* ${finalData.tipo_movimiento || 'No especificado'}\n` +
-      `💳 *Método de pago:* ${finalData.medio_pago}\n\n` +
-      `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`
-    });
   };
 
 
@@ -2130,7 +2222,17 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
   // 💾 Guardar comprobante final
   const saveComprobante = async (jid, userData) => {
     try {
-      const result = await saveDataFirstFlow(userData.finalStructuredData);
+
+      const normalized = normalizeDateTime(userData.finalStructuredData || {});
+
+      const payload = {
+      ...normalized,
+      fecha: normalized.fecha_iso // <- para timestamptz
+      // Si tu columna es 'date', usa: fecha: normalized.fecha
+    };
+    delete payload.fecha_iso;
+
+      const result = await saveDataFirstFlow(payload);
       if (result.success) {
         await safeSendMessage(jid, { 
           text: "✅ Comprobante guardado exitosamente." 
@@ -2406,24 +2508,26 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
 };
 
   // ✅ Volver a confirmación final desde modificación
-  const proceedToFinalConfirmationFromModification = async (jid, finalData) => {
-    console.log('🔧 Datos recibidos en proceedToFinalConfirmationFromModification:', finalData);
-    
-    setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
-      finalStructuredData: finalData
-    });
+ const proceedToFinalConfirmationFromModification = async (jid, finalData) => {
+  console.log('🔧 Datos recibidos en proceedToFinalConfirmationFromModification:', finalData);
 
-    await safeSendMessage(jid, {
-      text: `📋 *Datos del comprobante (actualizados):*\n\n` +
-      `👤 *Destinatario:* ${finalData.nombre || 'No especificado'}\n` +
-      `💰 *Monto:* $${finalData.monto || 'No especificado'}\n` +
-      `📅 *Fecha:* ${finalData.fecha || 'No especificada'}\n` +
-      `🕐 *Hora:* ${finalData.hora || 'No especificada'}\n` +
-      `📊 *Tipo:* ${finalData.tipo_movimiento || 'No especificado'}\n` +
-      `💳 *Medio de pago:* ${finalData.medio_pago || 'No especificado'}\n\n` +
-      `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`
-    });
-  };
+  const normalized = normalizeDateTime(finalData);
+
+  setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
+    finalStructuredData: normalized
+  });
+
+  await safeSendMessage(jid, {
+    text: `📋 *Datos del comprobante (actualizados):*\n\n` +
+    `👤 *Destinatario:* ${normalized.nombre || 'No especificado'}\n` +
+    `💰 *Monto:* $${normalized.monto || 'No especificado'}\n` +
+    `📅 *Fecha:* ${normalized.fecha || 'No especificada'}\n` +
+    `🕐 *Hora:* ${normalized.hora || 'No especificada'}\n` +
+    `📊 *Tipo:* ${normalized.tipo_movimiento || 'No especificado'}\n` +
+    `💳 *Medio de pago:* ${normalized.medio_pago || 'No especificado'}\n\n` +
+    `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`
+  });
+};
 
   // Reemplazar el event handler connection.update (línea ~1800)
 
