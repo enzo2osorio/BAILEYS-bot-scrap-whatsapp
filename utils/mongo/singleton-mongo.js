@@ -30,4 +30,17 @@ async function closeClient() {
   clientPromise = null;
 }
 
-module.exports = { getClient, getDb, closeClient };
+// ...existing code...
+// Exporta un método explícito para “conectar” (retorna el cliente ya conectado)
+async function connectMongo() {
+  const client = await getClient();
+  return client;
+}
+
+// Opcional: estado rápido
+function isMongoConnected() {
+  return !!clientPromise;
+}
+
+module.exports = { getClient, getDb, closeClient, connectMongo, isMongoConnected };
+// ...existing code...

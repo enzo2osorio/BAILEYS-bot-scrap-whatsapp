@@ -50,8 +50,81 @@ let WA_IS_LATEST = false;
 let isConnecting = false;
 let reconnectTimer = null;
 
-
+const tempSessionCache = new Map();
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function saveTempSession(userId, structureOutput, flowState) {
+  const payload = { structureOutput: structureOutput || {}, flowState: flowState || 'UNKNOWN', lastUpdated: new Date() };
+  tempSessionCache.set(userId, payload);
+  try { await saveTempSessionDB(userId, payload.structureOutput, payload.flowState); } catch (e) {
+    console.log('⚠️ No se pudo persistir TempSession en Mongo:', e?.message || String(e));
+  }
+}
+
+// Limpiar sesión temporal
+async function clearTempSessionForUser(userId) {
+  tempSessionCache.delete(userId);
+  try { await clearTempSession(userId); } catch (_) {}
+}
+
+// Reanudar sesión si existe (desde mem o Mongo)
+async function resumeSessionIfExists(userId) {
+  let entry = tempSessionCache.get(userId);
+  if (!entry) {
+    entry = await getTempSession(userId);
+    if (!entry) return false;
+    entry = { structureOutput: entry.structureOutput, flowState: entry.flowState, lastUpdated: entry.lastUpdated };
+    tempSessionCache.set(userId, entry);
+  }
+
+  const data = entry.structureOutput || {};
+  // Mensaje de aviso
+  await safeSendMessage(userId, {
+    text:
+      "⚠️ Ocurrió un corte de conexión, pero seguimos donde lo dejamos.\n\n" +
+      "Estos son los datos procesados hasta ahora:\n" +
+      `• Destinatario: ${data.nombre || 'No detectado'}\n` +
+      `• Monto: ${data.monto ?? 'No detectado'}\n` +
+      `• Fecha: ${data.fecha || 'No detectada'}\n` +
+      `• Hora: ${data.hora || 'No detectada'}\n` +
+      `• Tipo: ${data.tipo_movimiento || 'No detectado'}\n` +
+      `• Medio de pago: ${data.medio_pago || 'No detectado'}\n\n` +
+      "Retomando el flujo…"
+  });
+
+  // Reconstruir el siguiente paso igual que processInitialMessage
+  const resolvedName = await autoResolveDestinatarioName(data, "");
+  const metodoPagoMatch = await matchMetodoPago(data.medio_pago);
+  const metodoPagoName = metodoPagoMatch?.name || data.medio_pago || null;
+
+  const baseData = { ...data, nombre: resolvedName };
+  await proceedToFinalConfirmationWithMetodoPago(userId, metodoPagoName, baseData);
+  await saveTempSession(userId, { ...baseData, medio_pago: metodoPagoName }, 'AWAITING_SAVE_CONFIRMATION');
+
+  return true;
+}
+
+
+async function resumeAllSessionsAfter428() {
+  const targetsFromCache = Array.from(tempSessionCache.keys());
+  let targets = targetsFromCache;
+
+  if (targets.length === 0) {
+    try {
+      const recent = await listRecentSessions(15);
+      targets = recent.map(r => r.userId);
+    } catch (_) {}
+  }
+
+  if (!targets || targets.length === 0) return;
+
+  console.log(`🔁 Reanudando ${targets.length} sesión(es) temporal(es) tras reconexión 428...`);
+  for (const jid of targets) {
+    try { await resumeSessionIfExists(jid); } catch (e) {
+      console.log(`⚠️ No se pudo reanudar sesión de ${jid}:`, e?.message || String(e));
+    }
+  }
+}
 
 function startKeepAlive() {
   clearInterval(keepAliveTimer);
@@ -116,7 +189,8 @@ const qrcode = require("qrcode");
 const checkSimilarDestinatario = require("./utils/checkSimilarDestinatario.js");
 const saveDestinatarioAliases = require("./utils/saveDestinatarioAliases.js");
 const checkDuplicateAliases = require("./utils/checkDuplicateAliases.js");
-const { closeClient } = require("./utils/mongo/singleton-mongo.js");
+const { closeClient, connectMongo } = require("./utils/mongo/singleton-mongo.js");
+const { saveTempSessionDB, getTempSession, clearTempSession, listRecentSessions } = require("./utils/mongo/temporal-sessions.js");
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
 
@@ -491,6 +565,75 @@ const clearUserState = (jid) => {
   console.log(`🧹 Estado de ${jid} limpiado`);
 };
 
+let is428RecoveryInProgress = false;
+global.pending428Resume = false;
+
+async function stopBaileysGracefully() {
+  try {
+    stopKeepAlive();
+  } catch (_) {}
+  try { clearTimeout(reconnectTimer); } catch (_) {}
+  reconnectTimer = null;
+
+  try { sock?.ev?.removeAllListeners?.(); } catch (_) {}
+  try { sock?.ws?.close?.(); } catch (_) {}
+  try { typeof sock?.end === 'function' && sock.end(); } catch (_) {}
+  // try { typeof sock?.logout === 'function' && await sock.logout(); } catch (_) {}
+  sock = null;
+}
+
+async function disconnectMongo(reason = '') {
+  try {
+    console.log(`🧹 Cerrando pool MongoDB${reason ? ` (motivo: ${reason})` : ''}...`);
+    await closeClient();
+    console.log('✅ MongoDB cerrado');
+  } catch (e) {
+    console.log('⚠️ Error cerrando MongoDB:', e?.message || String(e));
+  }
+}
+
+async function reconnectMongo() {
+  try {
+    await connectMongo(); // reutiliza el singleton, no crea pools nuevos
+    console.log('✅ MongoDB reconectado');
+  } catch (e) {
+    console.log('❌ Falló reconectar MongoDB:', e?.message || String(e));
+    throw e;
+  }
+}
+
+async function recoverFrom428() {
+  if (is428RecoveryInProgress) { console.log('⏳ Recuperación 428 ya en progreso; ignorando llamada duplicada'); return; }
+  is428RecoveryInProgress = true;
+  try {
+    console.log('🚨 428 detectado: ejecutando soft-restart (Mongo + Baileys)');
+    if (soket) updateQR("loading");
+    try { await instanceLockRelease?.(); } catch (_) {}
+    instanceLockRelease = null;
+
+    await stopBaileysGracefully();
+    await disconnectMongo('428');
+
+    const waitMs = parseInt(process.env.RECOVERY_428_WAIT_MS || '8000', 10);
+    console.log(`⏱️ Esperando ${Math.round(waitMs/1000)}s antes de reconectar...`);
+    await delay(waitMs);
+
+    await reconnectMongo();
+    await ensureSingleInstanceLock();
+
+    // Marcar reanudación pendiente
+    global.pending428Resume = true;
+
+    console.log('📱 Reconectando Baileys...');
+    await connectToWhatsApp();
+  } catch (e) {
+    console.log('❌ Falló la recuperación 428:', e?.message || String(e));
+    scheduleReconnect(15000);
+  } finally {
+    is428RecoveryInProgress = false;
+  }
+}
+
 
 // 📨 FUNCIONES PARA MENSAJES (botones eliminados, solo texto ahora)
 // Función para limpiar sesiones corruptas
@@ -631,6 +774,12 @@ const safeSendMessage = async (jid, content, options) => {
 const P = require("pino")({
   level: "silent",
 });
+
+const graceful = async (signal) => {
+  console.log(`\n${signal} recibido. Cerrando conexiones Mongo...`);
+  await closeClient().catch(()=>{});
+  process.exit(0);
+};
 
 async function connectToWhatsApp() {
 
@@ -961,23 +1110,24 @@ const msgRetryCounterCache = new NodeCache();
         reconnectDelay = 5000;
         break;
         
-      case 428:
-  console.log("🚫 Error 428: Connection Terminated - Sesión inválida detectada - REQUIERE limpieza");
-  shouldCleanSession = true;
-  shouldReconnect = true;
-  reconnectDelay = 10000;
+      case 428: {
+    console.log("🚫 Error 428: Connection Terminated - soft restart sin process.exit");
 
-  // Notificación (rate limited 30 min)
-  if (!global.last428NotifyAt || Date.now() - global.last428NotifyAt > 30 * 60 * 1000) {
-    const notifyJid = process.env.MY_NUMBER || process.env.NUMBER_1_ALLOWED;
-    if (notifyJid) {
-      await safeSendMessage(notifyJid, {
-        text: "⚠️ La sesión de WhatsApp del bot fue invalidada (428). Se requerirá reescanear el QR en /scan."
-      });
+    // Notificación (rate limited 30 min)
+    if (!global.last428NotifyAt || Date.now() - global.last428NotifyAt > 30 * 60 * 1000) {
+      const notifyJid = process.env.MY_NUMBER || process.env.NUMBER_1_ALLOWED;
+      if (notifyJid) {
+        await safeSendMessage(notifyJid, {
+          text: "⚠️ La sesión de WhatsApp marcó 428. Reiniciando bot y reconectando..."
+        }).catch(()=>{});
+      }
       global.last428NotifyAt = Date.now();
     }
+
+    // Evitar limpieza de credenciales y reconexión genérica
+    recoverFrom428().catch(() => {});
+    return; // <- importante: no continuar con la lógica genérica
   }
-  break;
 
       // 🔄 ERRORES QUE NO REQUIEREN LIMPIEZA (TEMPORALES O EXTERNOS)
        case 440:
@@ -1193,6 +1343,11 @@ meta: ${JSON.stringify(doc.meta || {}, null, 2)}
     global.macErrorCount = 0;
     global.lastMacErrorReset = Date.now();
     
+    if (global.pending428Resume) {
+      global.pending428Resume = false;
+      await resumeAllSessionsAfter428().catch(()=>{});
+    }
+    
     if (soket) {
       updateQR("connected");
     }
@@ -1222,6 +1377,24 @@ meta: ${JSON.stringify(doc.meta || {}, null, 2)}
 
 
   // 🔄 FUNCIONES DE MANEJO DE FLUJO CONVERSACIONAL
+
+  // ...existing code...
+async function autoResolveDestinatarioName(structuredData, caption) {
+  const baseName = (structuredData?.nombre || '').trim();
+  if (baseName) {
+    const m1 = await matchDestinatario(baseName);
+    if (m1?.clave) return m1.clave;
+  }
+  if (typeof caption === 'string' && caption.trim()) {
+    const nameInCaption = caption.split('-')[0].trim();
+    if (nameInCaption) {
+      const m2 = await matchDestinatario(nameInCaption);
+      if (m2?.clave) return m2.clave;
+    }
+  }
+  return baseName || null;
+}
+// ...existing code...
 
   // 🧠 Procesar mensaje inicial con OpenAI
   const processInitialMessage = async (jid, captureMessage, caption, quotedMsg) => {
@@ -1332,41 +1505,23 @@ Responde únicamente con el JSON, sin texto adicional.
               data = {};
             }
 
-      const destinatarioName = data.nombre || "Desconocido";
-      console.log({ destinatarioName });
+            await saveTempSession(jid, data, 'STRUCTURED_READY');
+            const destinatarioName = data.nombre || "Desconocido";
+            const resolvedName = await autoResolveDestinatarioName(data, caption);
+            const metodoPagoMatch = await matchMetodoPago(data.medio_pago);
+            const metodoPagoName = metodoPagoMatch?.name || data.medio_pago || null;
+            console.log({ destinatarioName });
 
-      // Buscar coincidencia de destinatario (IMPORTANTE: usar await porque es async)
-      const destinatarioMatch = await matchDestinatario(destinatarioName);
-          
-      if (destinatarioMatch.clave) {
-        console.log("✅ Destinatario encontrado:", { destinatarioMatch });
-        
-        // Guardar estado y datos
-        setUserState(jid, STATES.AWAITING_DESTINATARIO_CONFIRMATION, {
-          structuredData: data,
-          destinatarioMatch,
-          caption,
-          originalData: data
-        });
+            const baseData = { ...data, nombre: resolvedName };
+            await proceedToFinalConfirmationWithMetodoPago(jid, metodoPagoName, baseData);
 
-        // Enviar pregunta de confirmación con lista numerada
-        await safeSendMessage(jid, {
-          text: `✅ El destinatario es *${destinatarioMatch.clave}*\n\n¿Es correcto?\n\n1. Sí\n2. No\n3. Cancelar\n\nEscribe el número de tu opción:`
-        }, { quoted: quotedMsg });
-
-      } else {
-        console.log("❌ No se encontró destinatario, intentando con caption...");
-        // No se encontró coincidencia, intentar con caption
-        await trySecondDestinatarioMatch(jid, caption, data, quotedMsg);
-      }
-
-    } catch (error) {
-      console.error("❌ Error con OpenAI:", error.message);
-      await safeSendMessage(jid, {
-        text: "Ocurrió un error interpretando el mensaje."
-      }, { quoted: quotedMsg });
-    }
-  };
+            } catch (error) {
+              console.error("❌ Error con OpenAI:", error.message);
+              await safeSendMessage(jid, {
+                text: "Ocurrió un error interpretando el mensaje."
+              }, { quoted: quotedMsg });
+            }
+          };
 
   // 🔍 Segundo intento de coincidencia con caption
   const trySecondDestinatarioMatch = async (jid, caption, structuredData, quotedMsg) => {
@@ -1573,11 +1728,6 @@ const handleNewMetodoPagoName = async (jid, textMessage, userState, quotedMsg) =
     text: `✅ Método de pago *${nombreMetodoPago}* creado exitosamente.` 
   });
 
-  const graceful = async (signal) => {
-  console.log(`\n${signal} recibido. Cerrando conexiones Mongo...`);
-  await closeClient().catch(()=>{});
-  process.exit(0);
-};
 
   // Verificar si estamos en modo modificación
   const isModification = userState.data.isModification || userState.data.finalStructuredData;
@@ -1625,6 +1775,7 @@ const saveNewMetodoPago = async (name) => {
     ...structuredData,
     medio_pago: metodoPagoName
   });
+  await saveTempSession(jid, finalData, 'AWAITING_SAVE_CONFIRMATION');
 
   setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
     finalStructuredData: finalData
@@ -1774,6 +1925,7 @@ const saveNewMetodoPago = async (name) => {
         break;
       case 3: // Cancelar
         await safeSendMessage(jid, { text: "❌ Operación cancelada." });
+        await clearTempSessionForUser(jid); // <- limpiar salvavidas
         clearUserState(jid);
         break;
     }
@@ -2241,6 +2393,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     const result = await saveDataFirstFlow(payload);
     if (result.success) {
       await safeSendMessage(jid, { text: "✅ Comprobante guardado exitosamente." });
+      await clearTempSessionForUser(jid); // <- limpiar salvavidas
     } else {
       await safeSendMessage(jid, { text: "❌ Error guardando el comprobante. Intenta más tarde." });
     }
@@ -2511,6 +2664,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
   console.log('🔧 Datos recibidos en proceedToFinalConfirmationFromModification:', finalData);
 
   const normalized = normalizeDateTime(finalData);
+  await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
 
   setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
     finalStructuredData: normalized
