@@ -96,11 +96,9 @@ async function resumeSessionIfExists(userId) {
   const resolvedName = await autoResolveDestinatarioName(data, "");
   const metodoPagoMatch = await matchMetodoPago(data.medio_pago);
   const metodoPagoName = metodoPagoMatch?.name || data.medio_pago || null;
-
   const baseData = { ...data, nombre: resolvedName };
   await proceedToFinalConfirmationWithMetodoPago(userId, metodoPagoName, baseData);
   await saveTempSession(userId, { ...baseData, medio_pago: metodoPagoName }, 'AWAITING_SAVE_CONFIRMATION');
-
   return true;
 }
 
@@ -919,21 +917,11 @@ const msgRetryCounterCache = new NodeCache();
           // 📝 MANEJO DE MENSAJES DE TEXTO SEGÚN ESTADO
           if (messageType === "conversation" || messageType === "extendedTextMessage") {
             const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-            
-            // Manejar confirmaciones numeradas para destinatarios
-            if (userState.state === STATES.AWAITING_DESTINATARIO_CONFIRMATION) {
-              await handleDestinationConfirmation(jid, textMessage, userState, msg);
-              continue;
-            }
-            
-            if (userState.state === STATES.AWAITING_DESTINATARIO_SECOND_TRY) {
-              await handleSecondDestinationConfirmation(jid, textMessage, userState, msg);
-              continue;
-            }
-            if (userState.state === STATES.AWAITING_DESTINATARIO_CHOOSING_IN_LIST_OR_ADDING_NEW) {
-              await handleChoosingInListOrAddingNew(jid, textMessage, userState, msg);
-              continue;
-            }
+      
+           if (userState.state === STATES.AWAITING_DESTINATARIO_CHOOSING_IN_LIST_OR_ADDING_NEW) {
+             await handleChoosingInListOrAddingNew(jid, textMessage, userState, msg);
+             continue;
+           }
             
             if (userState.state === STATES.AWAITING_NEW_DESTINATARIO_NAME) {
               await handleNewDestinatarioName(jid, textMessage, userState, msg);
@@ -1506,11 +1494,10 @@ Responde únicamente con el JSON, sin texto adicional.
             }
 
             await saveTempSession(jid, data, 'STRUCTURED_READY');
-            const destinatarioName = data.nombre || "Desconocido";
             const resolvedName = await autoResolveDestinatarioName(data, caption);
             const metodoPagoMatch = await matchMetodoPago(data.medio_pago);
-            const metodoPagoName = metodoPagoMatch?.name || data.medio_pago || null;
-            console.log({ destinatarioName });
+            const metodoPagoName = metodoPagoMatch?.name || data.medio_pago || null; 
+            console.log(`🎯 Resuelto automáticamente - Destinatario: ${resolvedName}, Método: ${metodoPagoName}`);
 
             const baseData = { ...data, nombre: resolvedName };
             await proceedToFinalConfirmationWithMetodoPago(jid, metodoPagoName, baseData);
@@ -1523,30 +1510,6 @@ Responde únicamente con el JSON, sin texto adicional.
             }
           };
 
-  // 🔍 Segundo intento de coincidencia con caption
-  const trySecondDestinatarioMatch = async (jid, caption, structuredData, quotedMsg) => {
-    const nameInCaption = caption.split('-')[0].trim();
-    const destinatarioFromCaption = await matchDestinatario(nameInCaption, destinatarios);
-    
-    if (destinatarioFromCaption.clave) {
-      console.log("✅ Destinatario encontrado en segundo intento:", { destinatarioFromCaption });
-      
-      setUserState(jid, STATES.AWAITING_DESTINATARIO_SECOND_TRY, {
-        structuredData,
-        destinatarioMatch: destinatarioFromCaption,
-        caption,
-        originalData: structuredData
-      });
-
-      await safeSendMessage(jid, {
-        text: `🔍 Segundo intento: El destinatario es *${destinatarioFromCaption.clave}*\n\n¿Es correcto?\n\n1. Sí\n2. No\n3. Cancelar\n\nEscribe el número de tu opción:`
-      }, { quoted: quotedMsg });
-    } else {
-      console.log("❌ No se encontró destinatario en segundo intento, mostrando lista completa...");
-      // Mostrar lista completa de destinatarios en lugar de crear uno nuevo directamente
-      await showAllDestinatariosList(jid, structuredData);
-    }
-  };
 
   // 📝 Iniciar flujo de nuevo destinatario
   const startNewDestinatarioFlow = async (jid, structuredData) => {
@@ -1561,54 +1524,6 @@ Responde únicamente con el JSON, sin texto adicional.
       text: "🆕 Vamos a crear un nuevo destinatario.\n\nEscribe el nombre canónico del destinatario:"
     });
   };
-
-  // 🔘 Manejar confirmación de destinatario (primera vez)
-  const handleDestinationConfirmation = async (jid, textMessage, userState, quotedMsg) => {
-    const option = parseInt(textMessage.trim());
-    
-    if (isNaN(option) || option < 1 || option > 3) {
-      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
-      return;
-    }
-
-    switch (option) {
-      case 1: // Sí
-        await proceedToFinalConfirmation(jid, userState.data.destinatarioMatch.clave, userState.data.structuredData);
-        break;
-      case 2: // No
-        await trySecondDestinatarioMatch(jid, userState.data.caption, userState.data.structuredData, quotedMsg);
-        break;
-      case 3: // Cancelar
-        await safeSendMessage(jid, { text: "❌ Operación cancelada." });
-        clearUserState(jid);
-        break;
-    }
-  };
-
-  // 🔘 Manejar confirmación de destinatario (segundo intento)
-  const handleSecondDestinationConfirmation = async (jid, textMessage, userState, quotedMsg) => {
-    const option = parseInt(textMessage.trim());
-    
-    if (isNaN(option) || option < 1 || option > 3) {
-      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido (1, 2 o 3)." });
-      return;
-    }
-
-    switch (option) {
-      case 1: // Sí
-        await proceedToFinalConfirmation(jid, userState.data.destinatarioMatch.clave, userState.data.structuredData);
-        break;
-      case 2: // No
-        await showAllDestinatariosList(jid, userState.data.structuredData);
-        break;
-      case 3: // Cancelar
-        await safeSendMessage(jid, { text: "❌ Operación cancelada." });
-        clearUserState(jid);
-        break;
-    }
-  };
-
-
 
   // 📋 Mostrar lista completa de destinatarios
   const showAllDestinatariosList = async (jid, structuredData) => {
