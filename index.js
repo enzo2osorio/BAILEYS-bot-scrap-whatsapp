@@ -1017,6 +1017,7 @@ const msgRetryCounterCache = new NodeCache();
         const senderName = contactStore[jid]?.name || jid.split("@")[0];
         const messageType = getContentType(msg.message);
         
+        const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
         // 🚫 Filtrar mensajes de protocolo y otros tipos no relevantes
         if (messageType === "protocolMessage" || 
             messageType === "reactionMessage" || 
@@ -1036,7 +1037,6 @@ const msgRetryCounterCache = new NodeCache();
 
           // 📝 MANEJO DE MENSAJES DE TEXTO SEGÚN ESTADO
           if (messageType === "conversation" || messageType === "extendedTextMessage") {
-            const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
       
             if (userState.state === STATES.IDLE && /^lista$/i.test(textMessage.trim())) {
               await showAllDestinatariosList(jid, { });
