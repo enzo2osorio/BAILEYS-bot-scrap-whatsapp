@@ -1205,16 +1205,7 @@ const msgRetryCounterCache = new NodeCache();
               const documentPath = await downloadDocumentMessage(msg, senderName, messageId);
               
               if (documentPath) {
-                let extracted = "";
-                if (mimetype.startsWith('image/')) {
-                  console.log("🖼️ Documento es imagen (enviado como documento), OCR imagen");
-                  extracted = await extractTextFromImage(documentPath);
-                } else if (mimetype === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf')) {
-                  extracted = await extractTextFromDocument(documentPath, fileName);
-                } else {
-                  console.log("⚠️ Tipo de documento no soportado para extracción:", mimetype);
-                  extracted = `[Documento no soportado: ${fileName}]`;
-                }
+                let extracted = await extractTextFromDocument(documentPath, fileName);
                 captureMessage = [documentCaption, extracted].filter(Boolean).join("\n\n");
               } else {
                 console.log("❌ No se pudo descargar el documento");
