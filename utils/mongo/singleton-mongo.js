@@ -1,19 +1,26 @@
+'use strict';
 const { MongoClient, ServerApiVersion } = require('mongodb');
 
-let clientPromise = null;
+const MAX_POOL = parseInt(process.env.MONGO_MAX_POOL_SIZE || '10', 10);
+
+let clientPromise = global.__MONGO_CLIENT_PROMISE || null;
+let clientInstance = global.__MONGO_CLIENT_INSTANCE || null;
 
 async function getClient() {
-  if (clientPromise) return clientPromise;
+  if (clientPromise && clientInstance) return clientInstance;
   const uri = process.env.MONGO_URI;
+  if (!uri) throw new Error("MONGO_URI no definida");
   const client = new MongoClient(uri, {
-    maxPoolSize: 10,           // refuerzo además del query param
+    maxPoolSize: MAX_POOL,
     minPoolSize: 0,
     serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
-    connectTimeoutMS: 20000,
-    waitQueueTimeoutMS: 20000
+    monitorCommands: false
   });
   clientPromise = client.connect();
-  return clientPromise;
+  clientInstance = await clientPromise;
+  global.__MONGO_CLIENT_PROMISE = clientPromise;
+  global.__MONGO_CLIENT_INSTANCE = clientInstance;
+  return clientInstance;
 }
 
 async function getDb(dbName = process.env.MONGODB_DB || 'baileysss') {
@@ -22,25 +29,24 @@ async function getDb(dbName = process.env.MONGODB_DB || 'baileysss') {
 }
 
 async function closeClient() {
-  if (!clientPromise) return;
-  try {
-    const client = await clientPromise;
-    await client.close();
-  } catch (_) {}
+  if (!clientInstance) return;
+  try { await clientInstance.close(); } catch {}
+  clientInstance = null;
   clientPromise = null;
+  global.__MONGO_CLIENT_PROMISE = null;
+  global.__MONGO_CLIENT_INSTANCE = null;
 }
 
-// ...existing code...
-// Exporta un método explícito para “conectar” (retorna el cliente ya conectado)
-async function connectMongo() {
-  const client = await getClient();
-  return client;
+async function getServerStatus() {
+  try {
+    const client = await getClient();
+    const admin = client.db().admin();
+    // Atlas permite serverStatus en lectura básica
+    const status = await admin.command({ serverStatus: 1 });
+    return status;
+  } catch (e) {
+    return null;
+  }
 }
 
-// Opcional: estado rápido
-function isMongoConnected() {
-  return !!clientPromise;
-}
-
-module.exports = { getClient, getDb, closeClient, connectMongo, isMongoConnected };
-// ...existing code...
+module.exports = { getClient, getDb, closeClient, getServerStatus };
