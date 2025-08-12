@@ -62,6 +62,10 @@ let WA_IS_LATEST = false;
 let isConnecting = false;
 let reconnectTimer = null;
 
+const DEST_SCORE_MIN_LIST = parseFloat(process.env.DEST_SCORE_MIN_LIST || '0.65');   // debajo => forzar lista
+const DEST_SCORE_MIN_AUTO = parseFloat(process.env.DEST_SCORE_MIN_AUTO || '0.85');   // arriba => autoaceptar
+const METODO_PAGO_SCORE_MIN_LIST = parseFloat(process.env.METODO_PAGO_SCORE_MIN_LIST || '0.60'); // debajo => lista
+const METODO_PAGO_SCORE_MIN_AUTO = parseFloat(process.env.METODO_PAGO_SCORE_MIN_AUTO || '0.85'); // arriba => auto
 
 const tempSessionCache = new Map();
 global.tempSessionCache = global.tempSessionCache || new Map();
@@ -895,6 +899,43 @@ const graceful = async (signal) => {
   process.exit(0);
 };
 
+  async function routeMetodoPagoByScore(jid, structuredData) {
+  const metodoPagoMatch = await matchMetodoPago(structuredData.medio_pago);
+  const metodoPagoName = metodoPagoMatch?.name || structuredData.medio_pago || null;
+  const normalizedMetodoPagoName = metodoPagoName ? metodoPagoName.trim() : null;
+  let score = typeof metodoPagoMatch?.score === 'number'
+    ? metodoPagoMatch.score
+    : (typeof metodoPagoMatch?.bestScore === 'number' ? metodoPagoMatch.bestScore : -1);
+  if (metodoPagoMatch?.name && score < 0) score = 1.0;
+
+  if (!normalizedMetodoPagoName) {
+    await safeSendMessage(jid, { text: "💳 No se detectó método de pago. Selecciona uno:" });
+    await showAllMetodosPagoList(jid, structuredData);
+    return false;
+  }
+  if (score >= 0 && score < METODO_PAGO_SCORE_MIN_LIST) {
+    await safeSendMessage(jid, { text: `💳 El método "${normalizedMetodoPagoName}" no es claro. Selecciona uno:` });
+    await showAllMetodosPagoList(jid, structuredData);
+    return false;
+  }
+  if (score >= METODO_PAGO_SCORE_MIN_LIST && score < METODO_PAGO_SCORE_MIN_AUTO) {
+    setUserState(jid, STATES.AWAITING_MEDIO_PAGO_CONFIRMATION, {
+      structuredData,
+      metodoPagoMatch: { name: normalizedMetodoPagoName, score },
+      originalData: structuredData,
+      fuzzyMetodoPago: true
+    });
+    await safeSendMessage(jid, {
+      text: `🔍 Método detectado: *${normalizedMetodoPagoName}* (confianza ${(score*100).toFixed(1)}%).\n\n1. Sí\n2. No (lista)\n3. Cancelar`
+    });
+    return false;
+  }
+  // auto
+  await proceedToFinalConfirmationWithMetodoPago(jid, normalizedMetodoPagoName, structuredData);
+  return true;
+}
+
+
 async function connectToWhatsApp() {
 
   if (isConnecting) {
@@ -1164,12 +1205,20 @@ const msgRetryCounterCache = new NodeCache();
               const documentPath = await downloadDocumentMessage(msg, senderName, messageId);
               
               if (documentPath) {
-                // 🔍 Intentar extraer texto del documento
-                const extractedDocumentText = await extractTextFromDocument(documentPath, fileName);
-                captureMessage = [documentCaption || "", extractedDocumentText].filter(Boolean).join("\n\n");
+                let extracted = "";
+                if (mimetype.startsWith('image/')) {
+                  console.log("🖼️ Documento es imagen (enviado como documento), OCR imagen");
+                  extracted = await extractTextFromImage(documentPath);
+                } else if (mimetype === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf')) {
+                  extracted = await extractTextFromDocument(documentPath, fileName);
+                } else {
+                  console.log("⚠️ Tipo de documento no soportado para extracción:", mimetype);
+                  extracted = `[Documento no soportado: ${fileName}]`;
+                }
+                captureMessage = [documentCaption, extracted].filter(Boolean).join("\n\n");
               } else {
-                // Si no se pudo descargar, usar solo el caption
-                captureMessage = documentCaption;
+                console.log("❌ No se pudo descargar el documento");
+                captureMessage = documentCaption || `[Documento recibido: ${fileName}]`;
               }
             } else if (messageType === "conversation") {
               captureMessage = msg.message.conversation || "";
@@ -1528,7 +1577,6 @@ async function autoResolveDestinatarioName(structuredData, caption) {
   }
   return baseName || null;
 }
-// ...existing code...
 
   // 🧠 Procesar mensaje inicial con OpenAI
   const processInitialMessage = async (jid, captureMessage, caption, quotedMsg) => {
@@ -1628,39 +1676,68 @@ Responde únicamente con el JSON, sin texto adicional.
               ]
             });
 
-            const jsonString = response.choices[0].message.content.trim();
-            console.log("🤖 Respuesta OpenAI estructurada:", jsonString)
+           const jsonString = response.choices[0].message.content.trim();
+            console.log("🤖 Respuesta OpenAI estructurada:", jsonString);
 
             let data;
-            try {
-              data = JSON.parse(jsonString);
-            } catch (err) {
-              console.error("Error al parsear JSON de OpenAI:", err);
-              data = {};
-            }
+            try { data = JSON.parse(jsonString); } catch (err) { console.error("Error parse JSON:", err); data = {}; }
 
+            // Guardar sesión temporal base
             await saveTempSession(jid, data, 'STRUCTURED_READY');
-            let cacheEntry = tempSessionCache.get(jid);
-            if (cacheEntry) {
-              cacheEntry.lastActivityAt = Date.now();
-            } else {
-              // si luego cargas de DB, añade lastActivityAt ahora
-              tempSessionCache.set(jid, { structureOutput: data, flowState: 'STRUCTURED_READY', lastUpdated: new Date(), lastActivityAt: Date.now() });
-            }
+            const entry = tempSessionCache.get(jid);
+            if (entry) entry.lastActivityAt = Date.now();
+
+            // Resolver destinatario preliminar
             const resolvedName = await autoResolveDestinatarioName(data, caption);
             const metodoPagoMatch = await matchMetodoPago(data.medio_pago);
-            const metodoPagoName = metodoPagoMatch?.name || data.medio_pago || null; 
-            console.log(`🎯 Resuelto automáticamente - Destinatario: ${resolvedName}, Método: ${metodoPagoName}`);
+            const metodoPagoName = metodoPagoMatch?.name || data.medio_pago || null;
+            console.log(`🎯 Auto detección → Destinatario: ${resolvedName} | Método: ${metodoPagoName}`);
 
             const baseData = { ...data, nombre: resolvedName };
-            await proceedToFinalConfirmationWithMetodoPago(jid, metodoPagoName, baseData);
 
-            } catch (error) {
-              console.error("❌ Error con OpenAI:", error.message);
-              await safeSendMessage(jid, {
-                text: "Ocurrió un error interpretando el mensaje."
-              }, { quoted: quotedMsg });
+            // Validación destinatario
+            if (!resolvedName) {
+              await safeSendMessage(jid, { text: "👤 No se detectó destinatario con suficiente confianza. Selecciona o crea uno." });
+              await showAllDestinatariosList(jid, baseData);
+              return;
             }
+
+            let destMatchInfo = null;
+            try { destMatchInfo = await matchDestinatario(resolvedName); } catch (e) { console.log("⚠️ Error matchDestinatario:", e?.message); }
+
+            if (!destMatchInfo?.clave || destMatchInfo.scoreClave < DEST_SCORE_MIN_LIST) {
+              console.log(`⚠️ Score destinatario bajo (${destMatchInfo?.scoreClave || 0}) → lista`);
+              await safeSendMessage(jid, { text: "👤 El destinatario detectado no es claro. Selecciona uno o crea uno nuevo:" });
+              await showAllDestinatariosList(jid, baseData);
+              return;
+            }
+
+            if (destMatchInfo.scoreClave < DEST_SCORE_MIN_AUTO) {
+              console.log(`🔍 Destinatario necesita confirmación: ${destMatchInfo.clave} (score ${destMatchInfo.scoreClave})`);
+              setUserState(jid, STATES.AWAITING_DESTINATARIO_FUZZY_CONFIRMATION, {
+                structuredData: baseData,
+                originalData: baseData,
+                nombreCanonicoNuevo: resolvedName,
+                destinatarioSimilar: { name: destMatchInfo.clave },
+                isModification: false
+              });
+              await safeSendMessage(jid, {
+                text: `🔍 Posible destinatario: *${destMatchInfo.clave}* (confianza ${(destMatchInfo.scoreClave*100).toFixed(1)}%).\n\n1. ✅ Usar\n2. ➕ Crear nuevo "${resolvedName}"\n3. ❌ Cancelar`
+              });
+              return;
+            }
+
+            const acceptedDestName = destMatchInfo.clave;
+            const finalBaseData = { ...baseData, nombre: acceptedDestName };
+
+            // Ruta método de pago (maneja confirmación/lista/auto y dispara confirmación final si procede)
+            const proceed = await routeMetodoPagoByScore(jid, finalBaseData);
+            if (!proceed) return; // se quedó pidiendo confirmación/lista
+
+          } catch (error) {
+            console.error("❌ Error en processInitialMessage:", error.message);
+            await safeSendMessage(jid, { text: "❌ Ocurrió un error interpretando el mensaje." }, { quoted: quotedMsg });
+          }
           };
 
 
@@ -1861,23 +1938,41 @@ const saveNewMetodoPago = async (name) => {
   }
 };
 
+async function isMetodoPagoValido(nombre) {
+  if (!nombre) return false;
+  try {
+    const metodos = await getMetodosPago();
+    return metodos.some(m => m.name.toLowerCase() === nombre.toLowerCase());
+  } catch {
+    return false;
+  }
+}
 
+const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, structuredData) => {
+  // Si no es válido, redirigir a la lista
 
+  if (getUserState(jid).state === STATES.AWAITING_SAVE_CONFIRMATION) {
+  console.log("ℹ️ Ignorando confirmación duplicada (ya en AWAITING_SAVE_CONFIRMATION)");
+  return;
+}
 
-  const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, structuredData) => {
+  const valido = await isMetodoPagoValido(metodoPagoName);
+  if (!valido) {
+    console.log(`⚠️ Método de pago no válido o no coincide: "${metodoPagoName}". Solicitando selección manual.`);
+    await safeSendMessage(jid, { text: `💳 No se reconoció el método de pago "${metodoPagoName}". Selecciona uno existente o crea uno nuevo:` });
+    await showAllMetodosPagoList(jid, { ...structuredData, medio_pago: metodoPagoName });
+    return;
+  }
+
   const finalData = normalizeDateTime({
     ...structuredData,
     medio_pago: metodoPagoName
   });
   await saveTempSession(jid, finalData, 'AWAITING_SAVE_CONFIRMATION');
-
   setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
     finalStructuredData: finalData
   });
-
-  await safeSendMessage(jid, {
-    text: `${formatFinalConfirmation(finalData)}`
-  });
+  await safeSendMessage(jid, { text: `${formatFinalConfirmation(finalData)}` });
 };
 
 
@@ -2428,53 +2523,35 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     console.log(`🔍 Verificando método de pago: "${dataWithDestinatario.medio_pago}"`);
     
     // Buscar coincidencia de método de pago
-    const metodoPagoMatch = await matchMetodoPago(dataWithDestinatario.medio_pago);
-    
-    if (metodoPagoMatch.name) {
-      console.log("✅ Método de pago encontrado:", { metodoPagoMatch });
-      
-      // Guardar estado y datos
-      setUserState(jid, STATES.AWAITING_MEDIO_PAGO_CONFIRMATION, {
-        structuredData: dataWithDestinatario,
-        metodoPagoMatch,
-        originalData: dataWithDestinatario
-      });
-
-      // Enviar pregunta de confirmación
-      await safeSendMessage(jid, {
-        text: `💳 El método de pago es *${metodoPagoMatch.name}*\n\n¿Es correcto?\n\n1. Sí\n2. No\n3. Cancelar\n\nEscribe el número de tu opción:`
-      });
-
-    } else {
-      console.log("❌ No se encontró método de pago, mostrando lista completa...");
-      // No se encontró coincidencia, mostrar lista completa
-      await showAllMetodosPagoList(jid, dataWithDestinatario);
-    }
+    const proceed = await routeMetodoPagoByScore(jid, dataWithDestinatario);
+    if (!proceed) return;
   };
 
   // 💾 Guardar comprobante final
-  const saveComprobante = async (jid, userData) => {
+const saveComprobante = async (jid, userData) => {
   try {
     const normalized = normalizeDateTime(userData.finalStructuredData || {});
+    console.log('💾 Intentando guardar payload:', normalized);
 
-    // Mantener compatibilidad: fecha (dd/mm/yyyy) y hora (HH:mm)
-    const payload = {
+    const result = await saveDataFirstFlow({
       ...normalized,
-      fecha: normalized.fecha,      // dd/mm/yyyy (lo que espera saveDataFirstFlow)
-      hora: normalized.hora,        // HH:mm
-      fecha_iso: normalized.fecha_iso // opcional por si luego la usas como timestamptz
-    };
+      fecha: normalized.fecha,
+      hora: normalized.hora,
+      fecha_iso: normalized.fecha_iso
+    });
 
-    const result = await saveDataFirstFlow(payload);
+    console.log('💾 Resultado saveDataFirstFlow:', result);
+
     if (result.success) {
       await safeSendMessage(jid, { text: "✅ Comprobante guardado exitosamente." });
-      await clearTempSessionForUser(jid); // <- limpiar salvavidas
+      await clearTempSessionForUser(jid);
     } else {
+        console.log('❌ Detalle fallo saveDataFirstFlow:', result.error || JSON.stringify(result));
       await safeSendMessage(jid, { text: "❌ Error guardando el comprobante. Intenta más tarde." });
     }
     clearUserState(jid);
   } catch (error) {
-    console.error("Error guardando comprobante:", error);
+    console.error("❌ Error guardando comprobante (excepción):", error);
     await safeSendMessage(jid, { text: "❌ Error guardando el comprobante." });
     clearUserState(jid);
   }

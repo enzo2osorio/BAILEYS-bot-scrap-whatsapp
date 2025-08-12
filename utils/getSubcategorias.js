@@ -15,11 +15,6 @@ const getSubcategorias = async (categoriaId) => {
       throw error;
     }
     
-    console.log(`✅ Subcategorías obtenidas: ${data?.length || 0}`);
-    if (data?.length > 0) {
-      console.log("📋 Subcategorías:", data.map(s => `${s.id}: ${s.nombre}`).join(', '));
-    }
-    
     return data || [];
   } catch (error) {
     console.error('❌ Error obteniendo subcategorías:', error.message);

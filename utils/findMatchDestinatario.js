@@ -1,6 +1,7 @@
 const fuzzball = require("fuzzball");
 const supabase = require("../supabase");
 
+
 async function matchDestinatario(input, umbralClave = 0.65, umbralVariante = 0.9) {
   // 1️⃣ Normalizar el input
   if (!input || typeof input !== "string") {
