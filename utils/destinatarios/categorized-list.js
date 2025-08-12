@@ -1,10 +1,10 @@
 'use strict';
 
-const getCategorias = require('../getCategorias');
+const getCategorias = require('../getCategorias.js');
 // Estas funciones deberían existir ya en tus utils; ajusta nombres si difieren
 // Deben devolver arrays: [{ id, name, ... }]
-const getSubcategorias = require('../getSubcategorias');
-const { getDestinatarios } = require('./getDestinatarios');
+const {getSubcategoriasWithoutId} = require('../getSubcategoriasWithoutId.js');
+const { getDestinatarios } = require('./getDestinatarios.js');
 
 // Cache simple en memoria
 let taxonomyCache = {
@@ -23,7 +23,7 @@ async function ensureTaxonomyFresh() {
 
   const [cats, subs] = await Promise.all([
     getCategorias(),
-    getSubcategorias()
+    getSubcategoriasWithoutId()
   ]);
 
   taxonomyCache.categorias = new Map(cats.map(c => [c.id, c]));

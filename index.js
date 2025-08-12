@@ -210,7 +210,6 @@ function formatFinalConfirmation(data, updated = false) {
     `👤 *Destinatario:* ${data.nombre || 'No especificado'}\n` +
     `💰 *Monto:* ${montoStr}\n` +
     `📅 *Fecha:* ${data.fecha || 'No especificada'}\n` +
-    `🕐 *Hora:* ${data.hora || 'No especificada'}\n` +
     `📊 *Tipo:* ${data.tipo_movimiento || 'No especificado'}\n` +
     `💳 *Método de pago:* ${data.medio_pago || 'No especificado'}\n\n` +
     `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`;
