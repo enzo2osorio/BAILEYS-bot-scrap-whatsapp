@@ -1,7 +1,9 @@
 'use strict';
 
-const { MongoClient, Binary } = require('mongodb');
+const { Binary } = require('mongodb');
 const { initAuthCreds } = require('@whiskeysockets/baileys');
+const { getDb, getClient } = require('./singleton-mongo');
+
 
 // Helpers: detectar binarios y (de)serializar recursivamente
 const isTypedArray = (v) =>
@@ -82,6 +84,69 @@ const deserializeDeep = (input) => {
   return input;
 };
 
+
+const ALLOWED_JIDS = (process.env.ALLOWED_JIDS || process.env.ALLOWED_GROUP_JIDS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const ALLOWED_USER_JIDS = ALLOWED_JIDS.filter(j => j.endsWith('@s.whatsapp.net'));
+
+function isAllowedJid(jid) {
+  if (!ALLOWED_JIDS.length) return true; // modo permisivo si vacío
+  return ALLOWED_JIDS.includes(jid);
+}
+
+// (retro compat si otros módulos llaman esto)
+function isAllowedGroupJid(jid) {
+  return isAllowedJid(jid);
+}
+
+const NON_EXPIRING_BASE_KEY_PREFIXES = new Set([
+  'noiseKey',
+  'signedIdentityKey',
+  'advSecretKey',
+  'app-state-sync-key',
+  'app-state-sync-version',
+  'sender-key-memory'
+]);
+
+// Puedes opcionalmente cachear participantes de grupos permitidos (placeholder)
+const allowedSessionParticipants = new Set(ALLOWED_USER_JIDS); // por ahora sólo usuarios explícitos
+
+function isRelevantKey(type, id) {
+  if (NON_EXPIRING_BASE_KEY_PREFIXES.has(type)) return true;
+
+  if (type === 'sender-key') {
+    const groupJid = id.split('::')[0];
+    return isAllowedJid(groupJid);        // solo guardar sender-key de grupos permitidos
+  }
+
+  if (type === 'session') {
+    // Mantén todas las session keys (son pocas y necesarias para E2EE fluido)
+    return true;
+  }
+
+  if (type === 'pre-key') return true;     // necesarias para iniciar sesiones
+  if (type.startsWith('app-state')) return true;
+
+  return false;
+}
+
+async function ensureKeysIndexes(keysCol) {
+  try {
+    await keysCol.createIndex({ instanceId: 1, type: 1, id: 1 }, { unique: true }).catch(()=>{});
+    const ttlSec = parseInt(process.env.MONGO_KEYS_TTL_SECONDS || '7776000', 10);
+    await keysCol.createIndex(
+      { updatedAt: 1 },
+      { expireAfterSeconds: ttlSec, partialFilterExpression: { keep: { $ne: true } } }
+    ).catch(()=>{});
+  } catch (e) {
+    console.log('⚠️ Error creando índices keys:', e?.message || e);
+  }
+}
+
+
 /**
  * Persistencia de credenciales y llaves de Baileys en MongoDB.
  * Colecciones:
@@ -89,38 +154,24 @@ const deserializeDeep = (input) => {
  *  - {prefix}_keys:  { instanceId, type, id, value, updatedAt }
  */
 async function useMongoAuthState(options = {}) {
-  const mongoUrl =
-    options.mongoUrl ||
-    process.env.MONGO_URI ||
-    process.env.MONGO_URI;
-
   const dbName = options.dbName || process.env.MONGODB_DB || 'baileys';
   const collectionNamePrefix =
     options.collectionNamePrefix ||
     process.env.MONGODB_COLLECTION_PREFIX ||
     'waAuth';
-
   const instanceId = options.instanceId || process.env.BAILEYS_INSTANCE || 'default';
 
-  if (!mongoUrl) {
-    throw new Error('MONGO_URI/MONGO_URI no configurado.');
-  }
-
-  const client = new MongoClient(mongoUrl, {
-    ignoreUndefined: true,
-    maxPoolSize: 10,
-  });
-
-  await client.connect();
-  const db = client.db(dbName);
+  // Asegura que el singleton esté conectado
+  await getClient();
+  const db = await getDb(dbName);
   const credsCol = db.collection(`${collectionNamePrefix}_creds`);
   const keysCol = db.collection(`${collectionNamePrefix}_keys`);
 
-  await credsCol.createIndex({ instanceId: 1 }, { unique: true });
-  await keysCol.createIndex({ instanceId: 1, type: 1, id: 1 }, { unique: true });
+  await credsCol.createIndex({ instanceId: 1 }, { unique: true }).catch(()=>{});
+  await keysCol.createIndex({ instanceId: 1, type: 1, id: 1 }, { unique: true }).catch(()=>{});
+  await ensureKeysIndexes(keysCol);
 
-  // Cargar creds
-  const credsDoc = await credsCol.findOne({ instanceId });
+  const credsDoc = await credsCol.findOne({ instanceId }).catch(()=>null);
   const creds = credsDoc?.data ? deserializeDeep(credsDoc.data) : initAuthCreds();
 
   const writeCreds = async () => {
@@ -133,100 +184,82 @@ async function useMongoAuthState(options = {}) {
   };
 
   const keys = {
-    // get(type, ids) -> { id: value }
-    get: async (type, ids) => {
-      if (!Array.isArray(ids) || ids.length === 0) return {};
-      const docs = await keysCol
-        .find({ instanceId, type, id: { $in: ids } })
-        .toArray();
+  get: async (type, ids) => {
+    if (!Array.isArray(ids) || !ids.length) return {};
+    const docs = await keysCol.find({ instanceId, type, id: { $in: ids } }).toArray();
+    const out = {};
+    for (const d of docs) out[d.id] = deserializeDeep(d.value);
+    return out;
+  },
+  set: async (data) => {
+    if (!data) return;
+    const ops = [];
+    const now = new Date();
 
-      const result = {};
-      for (const doc of docs) {
-        result[doc.id] = deserializeDeep(doc.value);
-      }
-      return result;
-    },
-
-    // set({ [type]: { [id]: value|null } })
-    set: async (data) => {
-      if (!data) return;
-
-      const ops = [];
-      for (const [type, entries] of Object.entries(data)) {
-        for (const [id, value] of Object.entries(entries || {})) {
-          if (value) {
-            const serialized = serializeDeep(value);
+    for (const [type, entries] of Object.entries(data)) {
+      for (const [id, value] of Object.entries(entries || {})) {
+        const relevant = isRelevantKey(type, id);
+        if (value && relevant) {
+          const keep = NON_EXPIRING_BASE_KEY_PREFIXES.has(type);
             ops.push({
               updateOne: {
                 filter: { instanceId, type, id },
-                update: { $set: { value: serialized, updatedAt: new Date() } },
-                upsert: true,
-              },
+                update: {
+                  $set: {
+                    value: serializeDeep(value),
+                    updatedAt: now,
+                    keep: keep ? true : undefined
+                  }
+                },
+                upsert: true
+              }
             });
-          } else {
-            ops.push({ deleteOne: { filter: { instanceId, type, id } } });
-          }
+        } else if (!value && relevant) {
+          ops.push({ deleteOne: { filter: { instanceId, type, id } } });
+        } else {
+          // Ignorar silenciosamente claves irrelevantes
         }
       }
-
-      if (ops.length === 0) return;
-
-      const session = client.startSession();
+    }
+    if (ops.length) {
       try {
-        let inTxn = false;
-        try {
-          session.startTransaction();
-          inTxn = true;
-        } catch (_) {
-          // sin transacciones (standalone)
-        }
-
-        await keysCol.bulkWrite(ops, { ordered: false, session: inTxn ? session : undefined });
-        if (inTxn) await session.commitTransaction();
-      } catch (err) {
-        try { await session.abortTransaction(); } catch (_) {}
-        throw err;
-      } finally {
-        await session.endSession();
+        await keysCol.bulkWrite(ops, { ordered: false });
+      } catch (e) {
+        console.log('⚠️ Error bulkWrite keys filtradas:', e?.message || e);
       }
-    },
-  };
+    }
+  }
+};
 
   const state = { creds, keys };
   const saveCreds = async () => { await writeCreds(); };
-  const close = async () => { await client.close(); };
+  const close = async () => { /* no cerrar singleton aquí */ };
 
   return { state, saveCreds, close };
 }
 
-async function clearMongoAuthState({ mongoUrl, dbName, collectionNamePrefix = 'waAuth', instanceId = 'default' }) {
-  const client = new MongoClient(mongoUrl);
+async function clearMongoAuthState({
+  dbName = process.env.MONGODB_DB || 'baileysss',
+  collectionNamePrefix = process.env.MONGODB_COLLECTION_PREFIX || 'waAuthh',
+  instanceId = process.env.BAILEYS_INSTANCE || 'default'
+  // se ignora mongoUrl (ya usamos singleton)
+} = {}) {
   try {
-    await client.connect();
-    const db = client.db(dbName);
+    await getClient(); // asegura singleton inicializado
+    const db = await getDb(dbName);
+    const credsCol = db.collection(`${collectionNamePrefix}_creds`);
+    const keysCol  = db.collection(`${collectionNamePrefix}_keys`);
 
-    // Heurística: eliminar colecciones/documentos que correspondan a este instanceId
-    const colls = await db.listCollections().toArray();
-    const regex = new RegExp(`^${collectionNamePrefix}.*${instanceId}`, 'i');
+    const delCreds = await credsCol.deleteOne({ instanceId }).catch(()=>null);
+    const delKeys  = await keysCol.deleteMany({ instanceId }).catch(()=>null);
 
-    for (const c of colls) {
-      if (regex.test(c.name)) {
-        const coll = db.collection(c.name);
-        // Intento 1: borrar por campo instanceId (si existe)
-        const res = await coll.deleteMany({ instanceId }).catch(() => null);
-        // Intento 2: si la colección queda vacía, dropearla
-        const count = await coll.countDocuments().catch(() => 0);
-        if (count === 0) {
-          try { await coll.drop(); } catch (_) {}
-        }
-      }
-    }
-    return true;
-  } catch (err) {
-    console.log('⚠️ Error limpiando estado Mongo:', err?.message || err);
-    return false;
-  } finally {
-    await client.close().catch(() => {});
+    return {
+      success: true,
+      deletedCreds: delCreds?.deletedCount || 0,
+      deletedKeys: delKeys?.deletedCount || 0
+    };
+  } catch (e) {
+    return { success: false, error: e.message };
   }
 }
 

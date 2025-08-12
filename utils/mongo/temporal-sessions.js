@@ -23,6 +23,7 @@ async function saveTempSessionDB(userId, structureOutput, flowState) {
       $set: {
         userId,
         structureOutput: structureOutput || {},
+        lastActivityAt: now,
         flowState: flowState || 'UNKNOWN',
         lastUpdated: now
       }

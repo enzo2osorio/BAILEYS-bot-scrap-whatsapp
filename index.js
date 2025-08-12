@@ -20,6 +20,7 @@ const express = require("express");
 const fileUpload = require("express-fileupload");
 const cors = require("cors");
 const bodyParser = require("body-parser");
+const { buildCategorizedDestinatariosMessage } = require('./utils/destinatarios/categorized-list');
 const dotenv = require("dotenv");
 const openAI = require("openai");
 const vision = require("@google-cloud/vision");
@@ -34,12 +35,23 @@ const getSubcategorias = require('./utils/getSubcategorias.js');
 const getMetodosPago = require('./utils/getMetodosPago.js');
 const saveNewDestinatario = require('./utils/saveNewDestinatario.js');
 const matchMetodoPago = require('./utils/findMatchMetodoPago.js');
+const { startMongoConnectionMonitor } = require('./utils/mongo/mongo-monitor.js');
 
 dotenv.config();
 
+const INACTIVITY_TIMEOUT_MS = parseInt(process.env.INACTIVITY_TIMEOUT_MS || '180000', 10);
+const ALLOWED_JIDS = (process.env.ALLOWED_JIDS || process.env.ALLOWED_GROUP_JIDS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+const allowedSet = new Set(ALLOWED_JIDS);
+function isAllowedJid(jid) {
+  if (!ALLOWED_JIDS.length) return true;
+  return allowedSet.has(jid);
+}
+let messageFreezeUntil = 0;
+let mongoMonitorStarted = false;
 let instanceLockRelease = null;
-// TODO: AGREGAR ESTADOS PARA MANEJAR EL METODO DE PAGO PARECIDO AL MANEJO DE DESTINATARIO.
-// 🔄 SISTEMA DE ESTADO PERSISTENTE POR USUARIO
 const stateMap = new Map();
 const TIMEOUT_DURATION = 3 * 60 * 1000; // 3 minutos en milisegundos
 // --- añadidos para control de envío inicial, keep-alive y reconexión simple ---
@@ -50,14 +62,89 @@ let WA_IS_LATEST = false;
 let isConnecting = false;
 let reconnectTimer = null;
 
+
 const tempSessionCache = new Map();
+global.tempSessionCache = global.tempSessionCache || new Map();
+
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
+function touchUserActivity(userId) {
+  const entry = tempSessionCache.get(userId);
+  if (entry) {
+    entry.lastActivityAt = Date.now();
+  }
+}
+
+function buildProgressSummary(data = {}) {
+  const d = data || {};
+  const line = (k, v) => `• ${k}: ${v == null || v === '' ? 'No detectado' : v}`;
+  return [
+    "Estos son los datos procesados hasta ahora:",
+    "",
+    line('Destinatario', d.nombre),
+    line('Monto', d.monto),
+    line('Fecha', d.fecha),
+    line('Hora', d.hora),
+    line('Tipo', d.tipo_movimiento),
+    line('Medio de pago', d.medio_pago)
+  ].join('\n');
+}
+
+async function clearUserFlow(userId, reason = 'unknown', opts = {}) {
+  try {
+    // Borrar en memoria
+    tempSessionCache.delete(userId);
+    // Borrar en Mongo (temporal session)
+    if (typeof clearTempSession === 'function') {
+      await clearTempSession(userId).catch(()=>{});
+    }
+    // Limpiar estado conversacional
+    clearUserState(userId);
+    console.log(`🧹 Flow limpiado user=${userId} reason=${reason}`);
+    // Mensaje opcional al usuario (si se desea centralizar)
+    if (opts.notify && opts.notifyText) {
+      await safeSendMessage(userId, { text: opts.notifyText }).catch(()=>{});
+    }
+  } catch (e) {
+    console.log(`⚠️ Error clearUserFlow user=${userId}:`, e?.message || e);
+  }
+}
+
+function isSessionExpired(entry) {
+  if (!entry) return true;
+  const la = entry.lastActivityAt || entry.lastUpdated || 0;
+  return (Date.now() - la) > INACTIVITY_TIMEOUT_MS;
+}
+
+
+function purgeExpiredTempSessions() {
+  const now = Date.now();
+  for (const [userId, entry] of tempSessionCache.entries()) {
+    const la = entry.lastActivityAt || entry.lastUpdated || 0;
+    if (now - la > INACTIVITY_TIMEOUT_MS) {
+      tempSessionCache.delete(userId);
+      console.log(`⏲️ Purga automática de sesión expirada cache user=${userId}`);
+    }
+  }
+}
+
+if (!global.__TEMP_PURGE_TIMER) {
+  global.__TEMP_PURGE_TIMER = setInterval(purgeExpiredTempSessions, 60000).unref();
+}
+
 async function saveTempSession(userId, structureOutput, flowState) {
-  const payload = { structureOutput: structureOutput || {}, flowState: flowState || 'UNKNOWN', lastUpdated: new Date() };
+  const now = Date.now();
+  const payload = {
+    structureOutput: structureOutput || {},
+    flowState: flowState || 'UNKNOWN',
+    lastUpdated: new Date(),
+    lastActivityAt: now
+  };
   tempSessionCache.set(userId, payload);
-  try { await saveTempSessionDB(userId, payload.structureOutput, payload.flowState); } catch (e) {
-    console.log('⚠️ No se pudo persistir TempSession en Mongo:', e?.message || String(e));
+  try {
+    await saveTempSessionDB(userId, payload.structureOutput, payload.flowState);
+  } catch (e) {
+    console.log('⚠️ No se pudo persistir TempSession Mongo:', e?.message || String(e));
   }
 }
 
@@ -71,56 +158,86 @@ async function clearTempSessionForUser(userId) {
 async function resumeSessionIfExists(userId) {
   let entry = tempSessionCache.get(userId);
   if (!entry) {
-    entry = await getTempSession(userId);
-    if (!entry) return false;
-    entry = { structureOutput: entry.structureOutput, flowState: entry.flowState, lastUpdated: entry.lastUpdated };
-    tempSessionCache.set(userId, entry);
+    const dbEntry = await getTempSession(userId);
+    if (dbEntry) {
+      entry = {
+        structureOutput: dbEntry.structureOutput,
+        flowState: dbEntry.flowState,
+        lastUpdated: dbEntry.lastUpdated,
+        lastActivityAt: dbEntry.lastUpdated ? new Date(dbEntry.lastUpdated).getTime() : Date.now()
+      };
+      tempSessionCache.set(userId, entry);
+    }
+  }
+  if (!entry || isSessionExpired(entry)) {
+    if (entry) {
+      await clearUserFlow(userId, 'expired-before-resume');
+    }
+    return false;
   }
 
   const data = entry.structureOutput || {};
-  // Mensaje de aviso
-  await safeSendMessage(userId, {
-    text:
-      "⚠️ Ocurrió un corte de conexión, pero seguimos donde lo dejamos.\n\n" +
-      "Estos son los datos procesados hasta ahora:\n" +
-      `• Destinatario: ${data.nombre || 'No detectado'}\n` +
-      `• Monto: ${data.monto ?? 'No detectado'}\n` +
-      `• Fecha: ${data.fecha || 'No detectada'}\n` +
-      `• Hora: ${data.hora || 'No detectada'}\n` +
-      `• Tipo: ${data.tipo_movimiento || 'No detectado'}\n` +
-      `• Medio de pago: ${data.medio_pago || 'No detectado'}\n\n` +
-      "Retomando el flujo…"
-  });
-
-  // Reconstruir el siguiente paso igual que processInitialMessage
   const resolvedName = await autoResolveDestinatarioName(data, "");
   const metodoPagoMatch = await matchMetodoPago(data.medio_pago);
   const metodoPagoName = metodoPagoMatch?.name || data.medio_pago || null;
   const baseData = { ...data, nombre: resolvedName };
+  const summary = buildProgressSummary(baseData);
+
+  await safeSendMessage(userId, {
+    text: `⚠️ Ocurrió un corte de conexión.\n\n${summary}\n\nRetomando el flujo...`
+  }).catch(()=>{});
+
   await proceedToFinalConfirmationWithMetodoPago(userId, metodoPagoName, baseData);
   await saveTempSession(userId, { ...baseData, medio_pago: metodoPagoName }, 'AWAITING_SAVE_CONFIRMATION');
+
+  const refreshed = tempSessionCache.get(userId);
+  if (refreshed) refreshed.lastActivityAt = Date.now();
+
   return true;
+}
+
+function cleanAmount(raw) {
+  if (raw == null || raw === '') return 'No especificado';
+  if (typeof raw === 'number') return raw;
+  const num = parseFloat(String(raw).replace(/[^0-9.,-]/g,'').replace(',','.'));
+  return isNaN(num) ? raw : num;
+}
+
+function formatFinalConfirmation(data, updated = false) {
+  const montoVal = cleanAmount(data.monto);
+  const montoStr = (typeof montoVal === 'number') ? `$${montoVal}` : (String(montoVal).startsWith('$') ? montoVal : `$${montoVal}`);
+  return `📋 *Datos del comprobante${updated ? " (actualizados)" : ""}:*\n\n` +
+    `👤 *Destinatario:* ${data.nombre || 'No especificado'}\n` +
+    `💰 *Monto:* ${montoStr}\n` +
+    `📅 *Fecha:* ${data.fecha || 'No especificada'}\n` +
+    `🕐 *Hora:* ${data.hora || 'No especificada'}\n` +
+    `📊 *Tipo:* ${data.tipo_movimiento || 'No especificado'}\n` +
+    `💳 *Método de pago:* ${data.medio_pago || 'No especificado'}\n\n` +
+    `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`;
 }
 
 
 async function resumeAllSessionsAfter428() {
-  const targetsFromCache = Array.from(tempSessionCache.keys());
-  let targets = targetsFromCache;
+  const marginMin = Math.ceil((INACTIVITY_TIMEOUT_MS / 60000) + 1); // inactividad + 1 min
+  let targets = Array.from(tempSessionCache.keys());
 
   if (targets.length === 0) {
     try {
-      const recent = await listRecentSessions(15);
+      const recent = await listRecentSessions(marginMin);
       targets = recent.map(r => r.userId);
     } catch (_) {}
   }
 
-  if (!targets || targets.length === 0) return;
+  // Filtrar por whitelist
+  targets = targets.filter(j => isAllowedJid(j));
 
-  console.log(`🔁 Reanudando ${targets.length} sesión(es) temporal(es) tras reconexión 428...`);
+  if (!targets.length) return;
+
+  console.log(`🔁 Reanudando ${targets.length} sesión(es) tras 428 (filtradas)`);
+
   for (const jid of targets) {
-    try { await resumeSessionIfExists(jid); } catch (e) {
-      console.log(`⚠️ No se pudo reanudar sesión de ${jid}:`, e?.message || String(e));
-    }
+    try { await resumeSessionIfExists(jid); }
+    catch (e) { console.log(`⚠️ No se pudo reanudar ${jid}:`, e?.message || String(e)); }
   }
 }
 
@@ -154,6 +271,7 @@ const STATES = {
   AWAITING_DESTINATARIO_CHOOSING_IN_LIST_OR_ADDING_NEW: "awaiting_destinatario_choosing_in_list_or_adding_new", 
   AWAITING_NEW_DESTINATARIO_NAME: "awaiting_new_destinatario_name",
   AWAITING_DESTINATARIO_ALIASES: "awaiting_destinatario_aliases", 
+  
   AWAITING_DESTINATARIO_FUZZY_CONFIRMATION: "awaiting_destinatario_fuzzy_confirmation", 
   AWAITING_CATEGORY_SELECTION: "awaiting_category_selection",
   AWAITING_SUBCATEGORY_SELECTION: "awaiting_subcategory_selection",
@@ -187,7 +305,7 @@ const qrcode = require("qrcode");
 const checkSimilarDestinatario = require("./utils/checkSimilarDestinatario.js");
 const saveDestinatarioAliases = require("./utils/saveDestinatarioAliases.js");
 const checkDuplicateAliases = require("./utils/checkDuplicateAliases.js");
-const { closeClient, connectMongo } = require("./utils/mongo/singleton-mongo.js");
+const { closeClient, getClient } = require("./utils/mongo/singleton-mongo.js");
 const { saveTempSessionDB, getTempSession, clearTempSession, listRecentSessions } = require("./utils/mongo/temporal-sessions.js");
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
@@ -525,19 +643,16 @@ const initStore = () => {
 
 // 🔄 FUNCIONES PARA MANEJO DE ESTADO PERSISTENTE
 const setUserState = (jid, state, data = {}) => {
-  // Limpiar timeout anterior si existe
   const currentState = stateMap.get(jid);
   if (currentState?.timeout) {
-    console.log("current state timeout");
     clearTimeout(currentState.timeout);
   }
-
-  // Crear nuevo timeout
-  const timeout = setTimeout(() => {
-    clearUserState(jid);
-    safeSendMessage(jid, {
-      text: "⏰ El flujo se ha cancelado por inactividad (3 minutos). Envía un nuevo comprobante para comenzar nuevamente."
-    }).catch(console.error);
+  const timeout = setTimeout(async () => {
+    // Inactividad: limpiar todo
+    await clearUserFlow(jid, 'inactivity', {
+      notify: true,
+      notifyText: "⏰ El flujo se canceló por inactividad (3 minutos). Envía un nuevo comprobante para comenzar nuevamente."
+    });
   }, TIMEOUT_DURATION);
 
   stateMap.set(jid, {
@@ -546,8 +661,7 @@ const setUserState = (jid, state, data = {}) => {
     timestamp: Date.now(),
     timeout
   });
-
-  console.log(`🔄 Estado de ${jid} cambiado a: ${state}`);
+  console.log(`🔄 Estado de ${jid} => ${state}`);
 };
 
 const getUserState = (jid) => {
@@ -592,7 +706,8 @@ async function disconnectMongo(reason = '') {
 
 async function reconnectMongo() {
   try {
-    await connectMongo(); // reutiliza el singleton, no crea pools nuevos
+    // Forzar que el singleton vuelva a levantar conexión (si estaba cerrado)
+    await getClient(); // reutiliza el pool
     console.log('✅ MongoDB reconectado');
   } catch (e) {
     console.log('❌ Falló reconectar MongoDB:', e?.message || String(e));
@@ -603,6 +718,7 @@ async function reconnectMongo() {
 async function recoverFrom428() {
   if (is428RecoveryInProgress) { console.log('⏳ Recuperación 428 ya en progreso; ignorando llamada duplicada'); return; }
   is428RecoveryInProgress = true;
+    messageFreezeUntil = Date.now() + 2000; // congelar recepción inmediata
   try {
     console.log('🚨 428 detectado: ejecutando soft-restart (Mongo + Baileys)');
     if (soket) updateQR("loading");
@@ -665,12 +781,13 @@ try {
     }
 
     // Borrar estado en Mongo (crítico para 428)
-    await clearMongoAuthState({
-      mongoUrl: process.env.MONGO_URI,
+    const resultClear = await clearMongoAuthState({
       dbName: process.env.MONGODB_DB || 'baileysss',
       collectionNamePrefix: process.env.MONGODB_COLLECTION_PREFIX || 'waAuthh',
       instanceId: process.env.BAILEYS_INSTANCE || 'default'
     });
+
+    console.log("🧹 Limpieza auth Mongo:", resultClear);
 
     stateMap.clear();
     console.log("✅ Estados de usuarios limpiados");
@@ -882,11 +999,14 @@ const msgRetryCounterCache = new NodeCache();
   //  LISTENER PRINCIPAL - MENSAJES NUEVOS CON SISTEMA DE ESTADO PERSISTENTE
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
-      
+    
     for (const msg of messages) {
+      if (Date.now() < messageFreezeUntil) {
+        // Ignorar inputs durante la ventana de congelamiento
+        continue;
+      }
       try {
         if (!msg.message || !msg.key?.remoteJid) continue;
-
         const jid = msg?.key?.remoteJid;
         const messageId = msg?.key?.id;
         if (!jid || !messageId) {
@@ -904,20 +1024,25 @@ const msgRetryCounterCache = new NodeCache();
           console.log(`⏭️ Ignorando mensaje de tipo: ${messageType}`);
           continue;
         }
-        
-        console.log({messageType})
-        if (jid === process.env.NUMBER_1_ALLOWED || jid === process.env.MY_NUMBER) {
+          
+          console.log({messageType})
+        if (isAllowedJid(jid)) {
 
         // 🔄 Verificar estado actual del usuario
           const userState = getUserState(jid);
           console.log(`🔍 Estado actual de ${senderName}: ${userState.state}`);
 
-          // Esta sección ya no es necesaria - ahora usamos números en lugar de botones
+          touchUserActivity(jid);
 
           // 📝 MANEJO DE MENSAJES DE TEXTO SEGÚN ESTADO
           if (messageType === "conversation" || messageType === "extendedTextMessage") {
             const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
       
+            if (userState.state === STATES.IDLE && /^lista$/i.test(textMessage.trim())) {
+              await showAllDestinatariosList(jid, { });
+              continue;
+            }
+
            if (userState.state === STATES.AWAITING_DESTINATARIO_CHOOSING_IN_LIST_OR_ADDING_NEW) {
              await handleChoosingInListOrAddingNew(jid, textMessage, userState, msg);
              continue;
@@ -1006,6 +1131,18 @@ const msgRetryCounterCache = new NodeCache();
             let caption = "";
             let imagePath = "";
 
+            //mensaje tipo admin para comprobar el estado de las conexiones de mongo via wasap
+            if (textMessage === '!conns' && (jid === process.env.MY_NUMBER)) {
+              const { getServerStatus } = require('./utils/mongo/singleton-mongo');
+              const st = await getServerStatus();
+              if (st?.connections) {
+                await safeSendMessage(jid, { text: `🔍 Conexiones Mongo: current=${st.connections.current} available=${st.connections.available}` });
+              } else {
+                await safeSendMessage(jid, { text: "No se pudo obtener serverStatus." });
+              }
+              continue;
+            }
+
             if (messageType === "imageMessage") {
               caption = msg.message.imageMessage.caption || "";
 
@@ -1018,9 +1155,9 @@ const msgRetryCounterCache = new NodeCache();
 
               // 💡 Combinar caption + texto OCR
               captureMessage = [caption, extractedText].filter(Boolean).join("\n\n");
-            } else if (messageType === "documentWithCaptionMessage") {
+            } else if (messageType === "documentWithCaptionMessage" || messageType === "documentMessage") {
               // 📄 Manejo de documentos (PDFs, etc.)
-              const documentCaption = msg.message.documentWithCaptionMessage.caption || "";
+              const documentCaption = messageType === 'documentWithCaptionMessage' ? msg.message.documentWithCaptionMessage.caption || "" : msg.message.documentMessage || "";
               const fileName = msg.message.documentWithCaptionMessage.message?.documentMessage?.fileName || "";
               console.log(`📄 Documento recibido: ${fileName}`);
               
@@ -1030,7 +1167,7 @@ const msgRetryCounterCache = new NodeCache();
               if (documentPath) {
                 // 🔍 Intentar extraer texto del documento
                 const extractedDocumentText = await extractTextFromDocument(documentPath, fileName);
-                captureMessage = [documentCaption, extractedDocumentText].filter(Boolean).join("\n\n");
+                captureMessage = [documentCaption || "", extractedDocumentText].filter(Boolean).join("\n\n");
               } else {
                 // Si no se pudo descargar, usar solo el caption
                 captureMessage = documentCaption;
@@ -1332,10 +1469,20 @@ meta: ${JSON.stringify(doc.meta || {}, null, 2)}
     global.lastMacErrorReset = Date.now();
     
     if (global.pending428Resume) {
+      messageFreezeUntil = Date.now() + 2000; // pequeña ventana antes de procesar inputs
       global.pending428Resume = false;
       await resumeAllSessionsAfter428().catch(()=>{});
     }
-    
+
+    if (!mongoMonitorStarted) {
+          startMongoConnectionMonitor({
+            stopBaileysGracefully,
+            connectToWhatsApp
+          });
+          mongoMonitorStarted = true;
+          console.log("🩺 Monitor de conexiones Mongo iniciado");
+        }
+
     if (soket) {
       updateQR("connected");
     }
@@ -1494,6 +1641,13 @@ Responde únicamente con el JSON, sin texto adicional.
             }
 
             await saveTempSession(jid, data, 'STRUCTURED_READY');
+            let cacheEntry = tempSessionCache.get(jid);
+            if (cacheEntry) {
+              cacheEntry.lastActivityAt = Date.now();
+            } else {
+              // si luego cargas de DB, añade lastActivityAt ahora
+              tempSessionCache.set(jid, { structureOutput: data, flowState: 'STRUCTURED_READY', lastUpdated: new Date(), lastActivityAt: Date.now() });
+            }
             const resolvedName = await autoResolveDestinatarioName(data, caption);
             const metodoPagoMatch = await matchMetodoPago(data.medio_pago);
             const metodoPagoName = metodoPagoMatch?.name || data.medio_pago || null; 
@@ -1526,50 +1680,73 @@ Responde únicamente con el JSON, sin texto adicional.
   };
 
   // 📋 Mostrar lista completa de destinatarios
-  const showAllDestinatariosList = async (jid, structuredData) => {
-    try {
-      // Obtener todos los destinatarios de la base de datos
-      const { data: allDestinatarios, error } = await supabase
-        .from('destinatarios')
-        .select('id, name')
-        .order('name');
+const showAllDestinatariosList = async (jid, structuredData, opts = {}) => {
+  const { isModification = false, finalStructuredData = null } = opts;
+  try {
+    const { data: destinatariosRaw, error } = await supabase
+      .from('destinatarios')
+      .select('id,name,category_id,subcategory_id')
+      .order('name');
 
-      if (error) {
-        console.error("Error obteniendo destinatarios:", error);
-        await safeSendMessage(jid, { text: "❌ Error obteniendo la lista de destinatarios." });
-        clearUserState(jid);
-        return;
-      }
-
-      if (!allDestinatarios || allDestinatarios.length === 0) {
-        await safeSendMessage(jid, { text: "📋 No hay destinatarios registrados. Procederemos a crear uno nuevo." });
-        await startNewDestinatarioFlow(jid, structuredData);
-        return;
-      }
-
-      // Crear lista numerada (empezando desde 2)
-      let destinatarioList = "0. ❌ Cancelar\n1. ➕ Nuevo destinatario\n";
-      allDestinatarios.forEach((dest, index) => {
-        destinatarioList += `${index + 2}. ${dest.name}\n`;
-      });
-
-      // Guardar estado con los destinatarios disponibles
-      setUserState(jid, STATES.AWAITING_DESTINATARIO_CHOOSING_IN_LIST_OR_ADDING_NEW, {
-        structuredData,
-        allDestinatarios,
-        originalData: structuredData
-      });
-
-      await safeSendMessage(jid, {
-        text: `📋 *Lista completa de destinatarios:*\n\n${destinatarioList}\nEscribe el número del destinatario que corresponde:`
-      });
-
-    } catch (error) {
-      console.error("Error en showAllDestinatariosList:", error);
-      await safeSendMessage(jid, { text: "❌ Error mostrando la lista de destinatarios." });
+    if (error) {
+      console.error("Error obteniendo destinatarios:", error);
+      await safeSendMessage(jid, { text: "❌ Error obteniendo la lista de destinatarios." });
       clearUserState(jid);
+      return;
     }
-  };
+    if (!destinatariosRaw || destinatariosRaw.length === 0) {
+      await safeSendMessage(jid, { text: "📋 No hay destinatarios. Crearemos uno nuevo." });
+      await startNewDestinatarioFlow(jid, structuredData);
+      return;
+    }
+
+    const { blocks, indexMap } = await buildCategorizedDestinatariosMessage(destinatariosRaw, {
+      includeIds: false,
+      codePrefix: 'D'
+    });
+
+    // Mapear códigos al array lineal (orden de aparición)
+    const linear = [];
+    const seen = new Set();
+    for (const dest of indexMap.values()) {
+      if (!seen.has(dest.id)) {
+        linear.push(dest);
+        seen.add(dest.id);
+      }
+    }
+
+    setUserState(jid, STATES.AWAITING_DESTINATARIO_CHOOSING_IN_LIST_OR_ADDING_NEW, {
+      structuredData: isModification ? null : structuredData,
+      finalStructuredData: isModification ? finalStructuredData : null,
+      allDestinatarios: linear,
+      isModification,
+      originalData: structuredData
+    });
+
+    // Renumerar bloques (reemplazar Dn. por número real empezando en 2)
+    let counter = 2;
+    const renumber = (text) => text.replace(/(^|\n)(\s*)D(\d+)\.\s/g, (_, br, sp) => {
+      const line = `${br}${sp}${counter}. `;
+      counter++;
+      return line;
+    });
+
+    const transformed = blocks.map(renumber);
+
+    await safeSendMessage(jid, {
+      text: `📋 *Destinatarios categorizados:*\n\n0. ❌ Cancelar\n1. ➕ Nuevo destinatario\n\n${isModification ? 'Selecciona el nuevo destinatario:' : 'Elige un destinatario:'}\n\n${transformed[0]}`
+    });
+    for (let i = 1; i < transformed.length; i++) {
+      await safeSendMessage(jid, { text: transformed[i] });
+    }
+    await safeSendMessage(jid, { text: "👉 Escribe el número (0/1 para cancelar/crear)." });
+
+  } catch (e) {
+    console.error("Error en showAllDestinatariosList:", e);
+    await safeSendMessage(jid, { text: "❌ Error mostrando destinatarios." });
+    clearUserState(jid);
+  }
+};
 
   const handleMedioPagoSelection = async (jid, textMessage, userState, quotedMsg) => {
   const option = parseInt(textMessage.trim());
@@ -1685,6 +1862,9 @@ const saveNewMetodoPago = async (name) => {
   }
 };
 
+
+
+
   const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, structuredData) => {
   const finalData = normalizeDateTime({
     ...structuredData,
@@ -1697,14 +1877,7 @@ const saveNewMetodoPago = async (name) => {
   });
 
   await safeSendMessage(jid, {
-    text: `📋 *Datos del comprobante:*\n\n` +
-    `👤 *Destinatario:* ${finalData.nombre}\n` +
-    `💰 *Monto:* $${finalData.monto || 'No especificado'}\n` +
-    `📅 *Fecha:* ${finalData.fecha || 'No especificada'}\n` +
-    `🕐 *Hora:* ${finalData.hora || 'No especificada'}\n` +
-    `📊 *Tipo:* ${finalData.tipo_movimiento || 'No especificado'}\n` +
-    `💳 *Método de pago:* ${finalData.medio_pago}\n\n` +
-    `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`
+    text: `${formatFinalConfirmation(finalData)}`
   });
 };
 
@@ -1792,33 +1965,22 @@ const saveNewMetodoPago = async (name) => {
         await startNewDestinatarioFlow(jid, dataForNewDestinatario);
         break;
         
-      default: // Destinatario seleccionado (índices 2 en adelante)
-        const selectedIndex = option - 2; // Convertir a índice del array (0-based)
-        if (selectedIndex >= 0 && selectedIndex < allDestinatarios.length) {
-          const selectedDestinatario = allDestinatarios[selectedIndex];
-          console.log(`✅ Destinatario seleccionado: ${selectedDestinatario.name}`);
-
-          if (isModification) {
-            // Actualizar destinatario en modificación
-            const updatedData = {
-              ...userState.data.finalStructuredData,
-              nombre: selectedDestinatario.name
-            };
-            console.log('🔧 Destinatario actualizado en modificación:', {
-              anterior: userState.data.finalStructuredData.nombre,
-              nuevo: selectedDestinatario.name,
-              updatedData: updatedData
-            });
-            await safeSendMessage(jid, { text: `✅ Destinatario actualizado a: ${selectedDestinatario.name}` });
-            await proceedToFinalConfirmationFromModification(jid, updatedData);
-          } else {
-            // Flujo normal
-            await proceedToFinalConfirmation(jid, selectedDestinatario.name, userState.data.structuredData);
-          }
+        default: {
+        const idx = option - 2;
+        if (idx < 0 || idx >= allDestinatarios.length) {
+          await safeSendMessage(jid, { text: "⚠️ Número fuera de rango." });
+          return;
+        }
+        const selected = allDestinatarios[idx];
+        if (isModification) {
+          const updated = { ...userState.data.finalStructuredData, nombre: selected.name };
+          await safeSendMessage(jid, { text: `✅ Destinatario actualizado a: ${selected.name}` });
+          await proceedToFinalConfirmationFromModification(jid, updated);
         } else {
-          await safeSendMessage(jid, { text: "⚠️ Opción no válida. Intenta nuevamente." });
+          await proceedToFinalConfirmation(jid, selected.name, userState.data.structuredData);
         }
         break;
+      }
     }
   };
 
@@ -1840,9 +2002,8 @@ const saveNewMetodoPago = async (name) => {
         break;
       case 3: // Cancelar
         await safeSendMessage(jid, { text: "❌ Operación cancelada." });
-        await clearTempSessionForUser(jid); // <- limpiar salvavidas
-        clearUserState(jid);
-        break;
+        await clearUserFlow(jid, 'user-cancel');
+      return;
     }
   };
 
@@ -2350,7 +2511,11 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
         await proceedToFinalConfirmationFromModification(jid, userState.data.finalStructuredData);
         break;
       case 1: // Destinatario
-        await showDestinatariosForModification(jid, userState.data);
+        await showAllDestinatariosList(jid, userState.data.finalStructuredData, {
+          isModification: true,
+          finalStructuredData: userState.data.finalStructuredData
+        });
+        // await showDestinatariosForModification(jid, userState.data);
         break;
       case 2: // Monto
         setUserState(jid, STATES.AWAITING_MONTO_MODIFICATION, userState.data);
@@ -2376,48 +2541,6 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     }
   };
 
-  // 👤 Mostrar destinatarios para modificación
-  const showDestinatariosForModification = async (jid, userData) => {
-    try {
-      const { data: allDestinatarios, error } = await supabase
-        .from('destinatarios')
-        .select('id, name')
-        .order('name');
-
-      if (error) {
-        console.error("Error obteniendo destinatarios:", error);
-        await safeSendMessage(jid, { text: "❌ Error obteniendo la lista de destinatarios." });
-        await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
-        return;
-      }
-
-      if (!allDestinatarios || allDestinatarios.length === 0) {
-        await safeSendMessage(jid, { text: "📋 No hay destinatarios registrados." });
-        await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
-        return;
-      }
-
-      let destinatarioList = "0. ❌ Cancelar\n1. ➕ Nuevo destinatario\n";
-      allDestinatarios.forEach((dest, index) => {
-        destinatarioList += `${index + 2}. ${dest.name}\n`;
-      });
-
-      setUserState(jid, STATES.AWAITING_DESTINATARIO_MODIFICATION, {
-        ...userData,
-        allDestinatarios,
-        isModification: true
-      });
-
-      await safeSendMessage(jid, {
-        text: `👤 *Selecciona el nuevo destinatario:*\n\n${destinatarioList}\nEscribe el número del destinatario:`
-      });
-
-    } catch (error) {
-      console.error("Error en showDestinatariosForModification:", error);
-      await safeSendMessage(jid, { text: "❌ Error mostrando destinatarios." });
-      await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
-    }
-  };
 
   // 💳 Mostrar métodos de pago para modificación
   const showMediosPagoForModification = async (jid, userData) => {
@@ -2586,46 +2709,11 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
   });
 
   await safeSendMessage(jid, {
-    text: `📋 *Datos del comprobante (actualizados):*\n\n` +
-    `👤 *Destinatario:* ${normalized.nombre || 'No especificado'}\n` +
-    `💰 *Monto:* $${normalized.monto || 'No especificado'}\n` +
-    `📅 *Fecha:* ${normalized.fecha || 'No especificada'}\n` +
-    `🕐 *Hora:* ${normalized.hora || 'No especificada'}\n` +
-    `📊 *Tipo:* ${normalized.tipo_movimiento || 'No especificado'}\n` +
-    `💳 *Medio de pago:* ${normalized.medio_pago || 'No especificado'}\n\n` +
-    `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`
+    text: `${formatFinalConfirmation(normalized, true)}`
   });
 };
 
-  // Reemplazar el event handler connection.update (línea ~1800)
-
-
-  // sock.ev.on(
-  //   "messaging-history.set",
-  //   async ({ chats, contacts, messages, syncType }) => {
-  //     console.log("syncType:", syncType);
-  //     console.log(`Chats ${chats.length}, msgs ${messages.length}`);
-  //     await fs.promises.writeFile(
-  //       "history.json",
-  //       JSON.stringify({ chats, contacts, messages }, null, 2)
-  //     );
-  //     for (const m of messages) {
-  //       console.log(
-  //         `msg ${m.key.id} from ${m.key.remoteJid}`,
-  //         m.message?.imageMessage ? "📷" : ""
-  //       );
-  //       if (m.message?.imageMessage) {
-  //         const buf = await downloadMediaMessage(m, "buffer");
-  //         await fs.promises.writeFile(`img-${m.key.id}.jpg`, buf);
-  //       }
-  //     }
-  //   }
-  // );
 }
-
-
-
-
 
 async function downloadDocumentMessage(message, senderName, messageId) {
   try {
