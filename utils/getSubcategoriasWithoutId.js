@@ -1,3 +1,5 @@
+const supabase = require("../supabase");
+
 const getSubcategoriasWithoutId = async () => {
   try {
     console.log(`🔍 Intentando obtener subcategorías sin ID`);
