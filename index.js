@@ -35,7 +35,7 @@ const getSubcategorias = require('./utils/getSubcategorias.js');
 const getMetodosPago = require('./utils/getMetodosPago.js');
 const saveNewDestinatario = require('./utils/saveNewDestinatario.js');
 const matchMetodoPago = require('./utils/findMatchMetodoPago.js');
-const { startMongoConnectionMonitor } = require('./utils/mongo/mongo-monitor.js');
+const { startMongoConnectionMonitor } = require('./utils/mongo/monitor-mongo.js')
 
 dotenv.config();
 
