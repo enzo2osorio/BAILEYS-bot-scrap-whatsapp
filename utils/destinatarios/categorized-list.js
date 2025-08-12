@@ -1,10 +1,10 @@
 'use strict';
 
+const getCategorias = require('../getCategorias');
 // Estas funciones deberían existir ya en tus utils; ajusta nombres si difieren
 // Deben devolver arrays: [{ id, name, ... }]
-const { fetchCategorias } = require('./fetch-categorias');      // ajusta ruta/nombre
-const { fetchSubcategorias } = require('./fetch-subcategorias'); // ajusta ruta/nombre
-const { fetchDestinatarios } = require('./fetch-destinatarios'); // ajusta ruta/nombre
+const getSubcategorias = require('../getSubcategorias');
+const { getDestinatarios } = require('./getDestinatarios');
 
 // Cache simple en memoria
 let taxonomyCache = {
@@ -22,8 +22,8 @@ async function ensureTaxonomyFresh() {
       taxonomyCache.subcategorias.size) return taxonomyCache;
 
   const [cats, subs] = await Promise.all([
-    fetchCategorias(),
-    fetchSubcategorias()
+    getCategorias(),
+    getSubcategorias()
   ]);
 
   taxonomyCache.categorias = new Map(cats.map(c => [c.id, c]));
@@ -116,7 +116,7 @@ function formatGrouped(grouped, {
  */
 async function buildCategorizedDestinatariosMessage(destinatariosInput, opts = {}) {
   await ensureTaxonomyFresh();
-  const destinatarios = destinatariosInput || await fetchDestinatarios(); // si no se pasan, los carga
+  const destinatarios = destinatariosInput || await getDestinatarios(); // si no se pasan, los carga
   const grouped = groupDestinatarios(destinatarios, taxonomyCache.categorias, taxonomyCache.subcategorias);
   return formatGrouped(grouped, opts);
 }
