@@ -899,7 +899,7 @@ const graceful = async (signal) => {
   process.exit(0);
 };
 
-  async function routeMetodoPagoByScore(jid, structuredData) {
+  async function routeMetodoPagoByScore(jid, structuredData, proceedFn) {
   const metodoPagoMatch = await matchMetodoPago(structuredData.medio_pago);
   const metodoPagoName = metodoPagoMatch?.name || structuredData.medio_pago || null;
   const normalizedMetodoPagoName = metodoPagoName ? metodoPagoName.trim() : null;
@@ -931,7 +931,7 @@ const graceful = async (signal) => {
     return false;
   }
   // auto
-  await proceedToFinalConfirmationWithMetodoPago(jid, normalizedMetodoPagoName, structuredData);
+  await proceedFn(jid, normalizedMetodoPagoName, structuredData);
   return true;
 }
 
@@ -1722,7 +1722,7 @@ Responde únicamente con el JSON, sin texto adicional.
             const finalBaseData = { ...baseData, nombre: acceptedDestName };
 
             // Ruta método de pago (maneja confirmación/lista/auto y dispara confirmación final si procede)
-            const proceed = await routeMetodoPagoByScore(jid, finalBaseData);
+           const proceed = await routeMetodoPagoByScore(jid, finalBaseData, proceedToFinalConfirmationWithMetodoPago);
             if (!proceed) return; // se quedó pidiendo confirmación/lista
 
           } catch (error) {
@@ -2514,7 +2514,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     console.log(`🔍 Verificando método de pago: "${dataWithDestinatario.medio_pago}"`);
     
     // Buscar coincidencia de método de pago
-    const proceed = await routeMetodoPagoByScore(jid, dataWithDestinatario);
+    const proceed = await routeMetodoPagoByScore(jid, dataWithDestinatario, proceedToFinalConfirmationWithMetodoPago);
     if (!proceed) return;
   };
 
