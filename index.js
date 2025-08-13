@@ -899,40 +899,59 @@ const graceful = async (signal) => {
   process.exit(0);
 };
 
-  async function routeMetodoPagoByScore(jid, structuredData, proceedFn) {
-  const metodoPagoMatch = await matchMetodoPago(structuredData.medio_pago);
-  const metodoPagoName = metodoPagoMatch?.name || structuredData.medio_pago || null;
-  const normalizedMetodoPagoName = metodoPagoName ? metodoPagoName.trim() : null;
-  let score = typeof metodoPagoMatch?.score === 'number'
-    ? metodoPagoMatch.score
-    : (typeof metodoPagoMatch?.bestScore === 'number' ? metodoPagoMatch.bestScore : -1);
-  if (metodoPagoMatch?.name && score < 0) score = 1.0;
+async function routeMetodoPagoByScore(jid, structuredData, proceedFn, showListFn) {
+  try {
+    const metodoPagoMatch = await matchMetodoPago(structuredData.medio_pago);
+    const metodoPagoName = metodoPagoMatch?.name || structuredData.medio_pago || null;
+    const normalizedMetodoPagoName = metodoPagoName ? metodoPagoName.trim() : null;
 
-  if (!normalizedMetodoPagoName) {
-    await safeSendMessage(jid, { text: "💳 No se detectó método de pago. Selecciona uno:" });
-    await showAllMetodosPagoList(jid, structuredData);
+    let score = typeof metodoPagoMatch?.score === 'number'
+      ? metodoPagoMatch.score
+      : (typeof metodoPagoMatch?.bestScore === 'number' ? metodoPagoMatch.bestScore : -1);
+    if (metodoPagoMatch?.name && score < 0) score = 1.0;
+
+    // 1) No detectado -> mostrar lista
+    if (!normalizedMetodoPagoName) {
+      await safeSendMessage(jid, { text: "💳 No se detectó método de pago. Selecciona uno:" });
+      await showListFn(jid, structuredData);
+      return false;
+    }
+
+    // 2) Score bajo -> lista
+    if (score >= 0 && score < METODO_PAGO_SCORE_MIN_LIST) {
+      await safeSendMessage(jid, { text: `💳 El método "${normalizedMetodoPagoName}" no es claro. Selecciona uno:` });
+      await showListFn(jid, structuredData);
+      return false;
+    }
+
+    // 3) Score intermedio -> confirmación fuzzy
+    if (score >= METODO_PAGO_SCORE_MIN_LIST && score < METODO_PAGO_SCORE_MIN_AUTO) {
+      setUserState(jid, STATES.AWAITING_MEDIO_PAGO_CONFIRMATION, {
+        structuredData,
+        metodoPagoMatch: { name: normalizedMetodoPagoName, score },
+        originalData: structuredData,
+        fuzzyMetodoPago: true
+      });
+      await safeSendMessage(jid, {
+        text: `🔍 Método detectado: *${normalizedMetodoPagoName}* (confianza ${(score*100).toFixed(1)}%).\n\n1. Sí\n2. No (lista)\n3. Cancelar`
+      });
+      return false;
+    }
+
+    // 4) Auto (score alto o exacto)
+    await proceedFn(jid, normalizedMetodoPagoName, structuredData);
+    return true;
+  } catch (e) {
+    console.log("❌ Error en routeMetodoPagoByScore:", e.message);
+    // Fallback: mostrar lista para no bloquear el flujo
+    try {
+      await safeSendMessage(jid, { text: "⚠️ Ocurrió un problema detectando el método. Selecciona uno de la lista:" });
+      await showListFn(jid, structuredData);
+    } catch (e2) {
+      console.log("❌ Error mostrando lista de métodos de pago (fallback):", e2.message);
+    }
     return false;
   }
-  if (score >= 0 && score < METODO_PAGO_SCORE_MIN_LIST) {
-    await safeSendMessage(jid, { text: `💳 El método "${normalizedMetodoPagoName}" no es claro. Selecciona uno:` });
-    await showAllMetodosPagoList(jid, structuredData);
-    return false;
-  }
-  if (score >= METODO_PAGO_SCORE_MIN_LIST && score < METODO_PAGO_SCORE_MIN_AUTO) {
-    setUserState(jid, STATES.AWAITING_MEDIO_PAGO_CONFIRMATION, {
-      structuredData,
-      metodoPagoMatch: { name: normalizedMetodoPagoName, score },
-      originalData: structuredData,
-      fuzzyMetodoPago: true
-    });
-    await safeSendMessage(jid, {
-      text: `🔍 Método detectado: *${normalizedMetodoPagoName}* (confianza ${(score*100).toFixed(1)}%).\n\n1. Sí\n2. No (lista)\n3. Cancelar`
-    });
-    return false;
-  }
-  // auto
-  await proceedFn(jid, normalizedMetodoPagoName, structuredData);
-  return true;
 }
 
 
@@ -1722,7 +1741,7 @@ Responde únicamente con el JSON, sin texto adicional.
             const finalBaseData = { ...baseData, nombre: acceptedDestName };
 
             // Ruta método de pago (maneja confirmación/lista/auto y dispara confirmación final si procede)
-           const proceed = await routeMetodoPagoByScore(jid, finalBaseData, proceedToFinalConfirmationWithMetodoPago);
+           const proceed = await routeMetodoPagoByScore(jid, finalBaseData, proceedToFinalConfirmationWithMetodoPago, showAllMetodosPagoList);
             if (!proceed) return; // se quedó pidiendo confirmación/lista
 
           } catch (error) {
@@ -2514,7 +2533,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     console.log(`🔍 Verificando método de pago: "${dataWithDestinatario.medio_pago}"`);
     
     // Buscar coincidencia de método de pago
-    const proceed = await routeMetodoPagoByScore(jid, dataWithDestinatario, proceedToFinalConfirmationWithMetodoPago);
+    const proceed = await routeMetodoPagoByScore(jid, dataWithDestinatario, proceedToFinalConfirmationWithMetodoPago, showAllMetodosPagoList);
     if (!proceed) return;
   };
 
