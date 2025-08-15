@@ -84,6 +84,105 @@ function sortIssuesByPriority(issues) {
   });
 }
 
+
+function norm(s) {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')   // quita acentos
+    .replace(/[\s\-_.]/g, '');         // quita separadores comunes
+}
+async function isKnownMedioPago(name) {
+  if (!name) return false;
+  try {
+    const metodos = await getMetodosPago();
+    if (!Array.isArray(metodos) || metodos.length === 0) return false;
+
+    const target = norm(name);
+    return metodos.some(m => norm(m.name) === target);
+  } catch {
+    return false;
+  }
+}
+function isValidTipoMovimiento(s) {
+  if (!s) return false;
+  const v = String(s).trim().toLowerCase();
+  return v === 'ingreso' || v === 'egreso';
+}
+function normalizeTipoMovimiento(s) {
+  if (!s) return null;
+  const v = String(s).trim().toLowerCase();
+  return v === 'ingreso' ? 'ingreso' : v === 'egreso' ? 'egreso' : null;
+}
+function isValidDateDDMMYYYY(s) {
+  if (typeof s !== 'string') return false;
+  const m = s.match(/^\s*(\d{1,2})\/(\d{1,2})\/(\d{4})\s*$/);
+  if (!m) return false;
+  const d = parseInt(m[1], 10), mo = parseInt(m[2], 10) - 1, y = parseInt(m[3], 10);
+  const dt = new Date(y, mo, d);
+  return dt.getFullYear() === y && dt.getMonth() === mo && dt.getDate() === d;
+}
+function isPositiveNumber(n) {
+  return typeof n === 'number' && isFinite(n) && n > 0;
+}
+async function isKnownMedioPago(name) {
+  if (!name) return false;
+  try {
+    const metodos = await getMetodosPago();
+    return metodos.some(m => m.name.toLowerCase() === String(name).toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function cleanAmount(raw) {
+  if (raw == null || raw === '') return 'No especificado';
+  if (typeof raw === 'number') return raw;
+  const num = parseFloat(String(raw).replace(/[^0-9.,-]/g,'').replace(',','.'));
+  return isNaN(num) ? raw : num;
+}
+
+
+// Devuelve lista de issues: [{ code, field, message }]
+async function validateFinalData(fd) {
+  const issues = [];
+
+  // Destinatario
+  if (!fd?.nombre || !String(fd.nombre).trim()) {
+    issues.push({ code: 'MISSING_DESTINATARIO', field: 'nombre', message: 'Falta el destinatario.' });
+  }
+
+  // Monto
+  const montoVal = cleanAmount(fd?.monto);
+  if (montoVal === 'No especificado' || isNaN(Number(montoVal)) || !isPositiveNumber(Number(montoVal))) {
+    issues.push({ code: 'INVALID_MONTO', field: 'monto', message: 'El monto es inválido o está vacío.' });
+  }
+
+  // Fecha
+  if (!fd?.fecha || !isValidDateDDMMYYYY(fd.fecha)) {
+    issues.push({ code: 'INVALID_FECHA', field: 'fecha', message: 'La fecha falta o no tiene formato dd/mm/yyyy.' });
+  }
+
+  // Tipo de movimiento
+  const tipo = normalizeTipoMovimiento(fd?.tipo_movimiento);
+  if (!tipo) {
+    issues.push({ code: 'INVALID_TIPO_MOV', field: 'tipo_movimiento', message: 'El tipo de movimiento falta o es inválido.' });
+  }
+
+  // Medio de pago
+  if (!fd?.medio_pago || !(await isKnownMedioPago(fd.medio_pago))) {
+    issues.push({ code: 'INVALID_MEDIO_PAGO', field: 'medio_pago', message: 'El método de pago falta o no es válido.' });
+  }
+
+  // Cuenta contable (recomendado, no bloqueante)
+  if (!fd?.cuenta_contable) {
+    issues.push({ code: 'MISSING_CUENTA_CONTABLE', field: 'cuenta_contable', message: 'Cuenta contable no establecida (opcional).' });
+  }
+
+  return issues;
+}
+
 async function routeFixForIssue(jid, issue, finalData) {
   switch (issue.code) {
     case 'MISSING_DESTINATARIO':
@@ -2168,43 +2267,38 @@ const showAllDestinatariosList = async (jid, structuredData, opts = {}) => {
 
 
 
-  const handleMedioPagoSelection = async (jid, textMessage, userState, quotedMsg) => {
+const handleMedioPagoSelection = async (jid, textMessage, userState, quotedMsg) => {
   const option = parseInt(textMessage.trim());
-  console.log(`🔍 Opción de método de pago seleccionada: ${option}`);
-  
-  const allMetodosPago = userState.data.allMetodosPago;
-  const maxOption = allMetodosPago.length + 1; // +1 por la opción "crear nuevo"
+  console.log(`🔍 AWAITING_MEDIO_PAGO_SELECTION -> opción: ${option}`);
+
+  const allMetodosPago = userState.data.allMetodosPago || [];
+  const maxOption = allMetodosPago.length + 1;
 
   if (isNaN(option) || option < 0 || option > maxOption) {
-    await safeSendMessage(jid, { 
-      text: `⚠️ Por favor, escribe un número válido (0 a ${maxOption}).` 
-    });
+    await safeSendMessage(jid, { text: `⚠️ Por favor, escribe un número válido (0 a ${maxOption}).` });
     return;
   }
 
   if (option === 0) {
-    // Cancelar
     await safeSendMessage(jid, { text: "❌ Operación cancelada." });
     clearUserState(jid);
     return;
   }
 
   if (option === 1) {
-    // Crear nuevo método de pago
     await startNewMetodoPagoFlow(jid, userState.data.structuredData);
     return;
   }
 
-  // Método de pago seleccionado (índices 2 en adelante)
-  const selectedIndex = option - 2; // Convertir a índice del array (0-based)
-  if (selectedIndex >= 0 && selectedIndex < allMetodosPago.length) {
-    const selectedMetodoPago = allMetodosPago[selectedIndex];
-    console.log(`✅ Método de pago seleccionado: ${selectedMetodoPago.name}`);
-
-    await proceedToFinalConfirmationWithMetodoPago(jid, selectedMetodoPago.name, userState.data.structuredData);
-  } else {
+  const selectedIndex = option - 2;
+  const selectedMetodoPago = allMetodosPago[selectedIndex];
+  if (!selectedMetodoPago) {
     await safeSendMessage(jid, { text: "⚠️ Opción no válida. Intenta nuevamente." });
+    return;
   }
+
+  console.log(`✅ Método de pago seleccionado: ${selectedMetodoPago.name}`);
+  await proceedToFinalConfirmationWithMetodoPago(jid, selectedMetodoPago.name, userState.data.structuredData);
 };
 
 const startNewMetodoPagoFlow = async (jid, structuredData) => {
@@ -2700,39 +2794,37 @@ const handleDestinatarioAliases = async (jid, textMessage, userState, quotedMsg)
 
 
 
-  const showAllMetodosPagoList = async (jid, structuredData) => {
-  try {
-    const metodosPago = await getMetodosPago();
+function showAllMetodosPagoList(jid, structuredData) {
+  return (async () => {
+    try {
+      const metodosPago = await getMetodosPago();
 
-    if (metodosPago.length === 0) {
-      await safeSendMessage(jid, { text: "❌ No hay métodos de pago registrados en el sistema." });
+      if (metodosPago.length === 0) {
+        await safeSendMessage(jid, { text: "❌ No hay métodos de pago registrados. Crea uno nuevo con la opción 1." });
+      }
+
+      let metodosList = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
+      metodosPago.forEach((metodo, index) => {
+        metodosList += `${index + 2}. ${metodo.name}\n`;
+      });
+
+      // Guardar estado con los métodos disponibles
+      setUserState(jid, STATES.AWAITING_MEDIO_PAGO_SELECTION, {
+        structuredData,
+        allMetodosPago: metodosPago,
+        originalData: structuredData
+      });
+
+      await safeSendMessage(jid, {
+        text: `💳 Lista de métodos de pago:\n\n${metodosList}\nEscribe el número del método de pago que corresponde:`
+      });
+    } catch (error) {
+      console.error("Error en showAllMetodosPagoList:", error);
+      await safeSendMessage(jid, { text: "❌ Error mostrando la lista de métodos de pago." });
       clearUserState(jid);
-      return;
     }
-
-    // Crear lista numerada empezando desde 2
-    let metodosList = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
-    metodosPago.forEach((metodo, index) => {
-      metodosList += `${index + 2}. ${metodo.name}\n`;
-    });
-
-    // Guardar estado con los métodos disponibles
-    setUserState(jid, STATES.AWAITING_MEDIO_PAGO_SELECTION, {
-      structuredData,
-      allMetodosPago: metodosPago,
-      originalData: structuredData
-    });
-
-    await safeSendMessage(jid, {
-      text: `💳 *Lista completa de métodos de pago:*\n\n${metodosList}\nEscribe el número del método de pago que corresponde:`
-    });
-
-  } catch (error) {
-    console.error("Error en showAllMetodosPagoList:", error);
-    await safeSendMessage(jid, { text: "❌ Error mostrando la lista de métodos de pago." });
-    clearUserState(jid);
-  }
-};
+  })();
+}
 
   // Agregar después de handleDestinatarioAliases
 // 📂 Proceder a selección de categoría con aliases
