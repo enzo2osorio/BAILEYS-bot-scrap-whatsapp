@@ -1,4 +1,24 @@
 
+function norm(s) {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')   // quita acentos
+    .replace(/[\s\-_.]/g, '');         // quita separadores comunes
+}
+async function isKnownMedioPago(name) {
+  if (!name) return false;
+  try {
+    const metodos = await getMetodosPago();
+    if (!Array.isArray(metodos) || metodos.length === 0) return false;
+
+    const target = norm(name);
+    return metodos.some(m => norm(m.name) === target);
+  } catch {
+    return false;
+  }
+}
 function isValidTipoMovimiento(s) {
   if (!s) return false;
   const v = String(s).trim().toLowerCase();
@@ -37,6 +57,7 @@ function cleanAmount(raw) {
   return isNaN(num) ? raw : num;
 }
 
+
 // Devuelve lista de issues: [{ code, field, message }]
 async function validateFinalData(fd) {
   const issues = [];
@@ -52,7 +73,7 @@ async function validateFinalData(fd) {
     issues.push({ code: 'INVALID_MONTO', field: 'monto', message: 'El monto es inválido o está vacío.' });
   }
 
-  // Fecha (si viene vacía queremos pedirla explícitamente)
+  // Fecha
   if (!fd?.fecha || !isValidDateDDMMYYYY(fd.fecha)) {
     issues.push({ code: 'INVALID_FECHA', field: 'fecha', message: 'La fecha falta o no tiene formato dd/mm/yyyy.' });
   }
@@ -68,7 +89,7 @@ async function validateFinalData(fd) {
     issues.push({ code: 'INVALID_MEDIO_PAGO', field: 'medio_pago', message: 'El método de pago falta o no es válido.' });
   }
 
-  // Cuenta contable (opcional, pero recomendamos)
+  // Cuenta contable (recomendado, no bloqueante)
   if (!fd?.cuenta_contable) {
     issues.push({ code: 'MISSING_CUENTA_CONTABLE', field: 'cuenta_contable', message: 'Cuenta contable no establecida (opcional).' });
   }
