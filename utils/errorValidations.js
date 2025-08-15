@@ -30,6 +30,13 @@ async function isKnownMedioPago(name) {
   }
 }
 
+function cleanAmount(raw) {
+  if (raw == null || raw === '') return 'No especificado';
+  if (typeof raw === 'number') return raw;
+  const num = parseFloat(String(raw).replace(/[^0-9.,-]/g,'').replace(',','.'));
+  return isNaN(num) ? raw : num;
+}
+
 // Devuelve lista de issues: [{ code, field, message }]
 async function validateFinalData(fd) {
   const issues = [];
