@@ -1,4 +1,5 @@
-const getMetodosPago = require('../getMetodosPago.js');
+const getMetodosPago = require("./getMetodosPago");
+
 
 // Normaliza cadenas: trim, lower, sin tildes y sin separadores comunes
 function norm(s) {
