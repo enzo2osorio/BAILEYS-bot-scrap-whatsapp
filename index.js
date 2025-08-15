@@ -1073,6 +1073,38 @@ const graceful = async (signal) => {
   process.exit(0);
 };
 
+function showAllMetodosPagoList(jid, structuredData) {
+  return (async () => {
+    try {
+      const metodosPago = await getMetodosPago();
+
+      if (metodosPago.length === 0) {
+        await safeSendMessage(jid, { text: "❌ No hay métodos de pago registrados. Crea uno nuevo con la opción 1." });
+      }
+
+      let metodosList = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
+      metodosPago.forEach((metodo, index) => {
+        metodosList += `${index + 2}. ${metodo.name}\n`;
+      });
+
+      // Guardar estado con los métodos disponibles
+      setUserState(jid, STATES.AWAITING_MEDIO_PAGO_SELECTION, {
+        structuredData,
+        allMetodosPago: metodosPago,
+        originalData: structuredData
+      });
+
+      await safeSendMessage(jid, {
+        text: `💳 Lista de métodos de pago:\n\n${metodosList}\nEscribe el número del método de pago que corresponde:`
+      });
+    } catch (error) {
+      console.error("Error en showAllMetodosPagoList:", error);
+      await safeSendMessage(jid, { text: "❌ Error mostrando la lista de métodos de pago." });
+      clearUserState(jid);
+    }
+  })();
+}
+
 async function routeMetodoPagoByScore(jid, structuredData, proceedFn, showListFn) {
   try {
     const metodoPagoMatch = await matchMetodoPago(structuredData.medio_pago);
@@ -2753,39 +2785,6 @@ const handleDestinatarioAliases = async (jid, textMessage, userState, quotedMsg)
   await proceedToCategorySelection(jid, userState.data, validAliases);
 };
 
-
-
-function showAllMetodosPagoList(jid, structuredData) {
-  return (async () => {
-    try {
-      const metodosPago = await getMetodosPago();
-
-      if (metodosPago.length === 0) {
-        await safeSendMessage(jid, { text: "❌ No hay métodos de pago registrados. Crea uno nuevo con la opción 1." });
-      }
-
-      let metodosList = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
-      metodosPago.forEach((metodo, index) => {
-        metodosList += `${index + 2}. ${metodo.name}\n`;
-      });
-
-      // Guardar estado con los métodos disponibles
-      setUserState(jid, STATES.AWAITING_MEDIO_PAGO_SELECTION, {
-        structuredData,
-        allMetodosPago: metodosPago,
-        originalData: structuredData
-      });
-
-      await safeSendMessage(jid, {
-        text: `💳 Lista de métodos de pago:\n\n${metodosList}\nEscribe el número del método de pago que corresponde:`
-      });
-    } catch (error) {
-      console.error("Error en showAllMetodosPagoList:", error);
-      await safeSendMessage(jid, { text: "❌ Error mostrando la lista de métodos de pago." });
-      clearUserState(jid);
-    }
-  })();
-}
 
   // Agregar después de handleDestinatarioAliases
 // 📂 Proceder a selección de categoría con aliases
