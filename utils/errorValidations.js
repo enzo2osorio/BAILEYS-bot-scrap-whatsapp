@@ -1,0 +1,79 @@
+
+function isValidTipoMovimiento(s) {
+  if (!s) return false;
+  const v = String(s).trim().toLowerCase();
+  return v === 'ingreso' || v === 'egreso';
+}
+function normalizeTipoMovimiento(s) {
+  if (!s) return null;
+  const v = String(s).trim().toLowerCase();
+  return v === 'ingreso' ? 'ingreso' : v === 'egreso' ? 'egreso' : null;
+}
+function isValidDateDDMMYYYY(s) {
+  if (typeof s !== 'string') return false;
+  const m = s.match(/^\s*(\d{1,2})\/(\d{1,2})\/(\d{4})\s*$/);
+  if (!m) return false;
+  const d = parseInt(m[1], 10), mo = parseInt(m[2], 10) - 1, y = parseInt(m[3], 10);
+  const dt = new Date(y, mo, d);
+  return dt.getFullYear() === y && dt.getMonth() === mo && dt.getDate() === d;
+}
+function isPositiveNumber(n) {
+  return typeof n === 'number' && isFinite(n) && n > 0;
+}
+async function isKnownMedioPago(name) {
+  if (!name) return false;
+  try {
+    const metodos = await getMetodosPago();
+    return metodos.some(m => m.name.toLowerCase() === String(name).toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+// Devuelve lista de issues: [{ code, field, message }]
+async function validateFinalData(fd) {
+  const issues = [];
+
+  // Destinatario
+  if (!fd?.nombre || !String(fd.nombre).trim()) {
+    issues.push({ code: 'MISSING_DESTINATARIO', field: 'nombre', message: 'Falta el destinatario.' });
+  }
+
+  // Monto
+  const montoVal = cleanAmount(fd?.monto);
+  if (montoVal === 'No especificado' || isNaN(Number(montoVal)) || !isPositiveNumber(Number(montoVal))) {
+    issues.push({ code: 'INVALID_MONTO', field: 'monto', message: 'El monto es inválido o está vacío.' });
+  }
+
+  // Fecha (si viene vacía queremos pedirla explícitamente)
+  if (!fd?.fecha || !isValidDateDDMMYYYY(fd.fecha)) {
+    issues.push({ code: 'INVALID_FECHA', field: 'fecha', message: 'La fecha falta o no tiene formato dd/mm/yyyy.' });
+  }
+
+  // Tipo de movimiento
+  const tipo = normalizeTipoMovimiento(fd?.tipo_movimiento);
+  if (!tipo) {
+    issues.push({ code: 'INVALID_TIPO_MOV', field: 'tipo_movimiento', message: 'El tipo de movimiento falta o es inválido.' });
+  }
+
+  // Medio de pago
+  if (!fd?.medio_pago || !(await isKnownMedioPago(fd.medio_pago))) {
+    issues.push({ code: 'INVALID_MEDIO_PAGO', field: 'medio_pago', message: 'El método de pago falta o no es válido.' });
+  }
+
+  // Cuenta contable (opcional, pero recomendamos)
+  if (!fd?.cuenta_contable) {
+    issues.push({ code: 'MISSING_CUENTA_CONTABLE', field: 'cuenta_contable', message: 'Cuenta contable no establecida (opcional).' });
+  }
+
+  return issues;
+}
+
+module.exports = {
+  isValidTipoMovimiento,
+  normalizeTipoMovimiento,
+  isValidDateDDMMYYYY,
+  isPositiveNumber,
+  isKnownMedioPago,
+  validateFinalData
+}

@@ -67,6 +67,7 @@ async function saveDataFirstFlow(params) {
       monto: monto != null ? Number(monto) : null,
       fecha: ts.toISOString(), // timestamptz
       tipo_movimiento,
+      origen: "bot",
       metodo_pago_id: existingMedioPago.id,
       descripcion: observacion ?? null,
       created_at: new Date().toISOString()
