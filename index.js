@@ -144,45 +144,6 @@ function cleanAmount(raw) {
 }
 
 
-// Devuelve lista de issues: [{ code, field, message }]
-async function validateFinalData(fd) {
-  const issues = [];
-
-  // Destinatario
-  if (!fd?.nombre || !String(fd.nombre).trim()) {
-    issues.push({ code: 'MISSING_DESTINATARIO', field: 'nombre', message: 'Falta el destinatario.' });
-  }
-
-  // Monto
-  const montoVal = cleanAmount(fd?.monto);
-  if (montoVal === 'No especificado' || isNaN(Number(montoVal)) || !isPositiveNumber(Number(montoVal))) {
-    issues.push({ code: 'INVALID_MONTO', field: 'monto', message: 'El monto es inválido o está vacío.' });
-  }
-
-  // Fecha
-  if (!fd?.fecha || !isValidDateDDMMYYYY(fd.fecha)) {
-    issues.push({ code: 'INVALID_FECHA', field: 'fecha', message: 'La fecha falta o no tiene formato dd/mm/yyyy.' });
-  }
-
-  // Tipo de movimiento
-  const tipo = normalizeTipoMovimiento(fd?.tipo_movimiento);
-  if (!tipo) {
-    issues.push({ code: 'INVALID_TIPO_MOV', field: 'tipo_movimiento', message: 'El tipo de movimiento falta o es inválido.' });
-  }
-
-  // Medio de pago
-  if (!fd?.medio_pago || !(await isKnownMedioPago(fd.medio_pago))) {
-    issues.push({ code: 'INVALID_MEDIO_PAGO', field: 'medio_pago', message: 'El método de pago falta o no es válido.' });
-  }
-
-  // Cuenta contable (recomendado, no bloqueante)
-  if (!fd?.cuenta_contable) {
-    issues.push({ code: 'MISSING_CUENTA_CONTABLE', field: 'cuenta_contable', message: 'Cuenta contable no establecida (opcional).' });
-  }
-
-  return issues;
-}
-
 async function routeFixForIssue(jid, issue, finalData) {
   switch (issue.code) {
     case 'MISSING_DESTINATARIO':
