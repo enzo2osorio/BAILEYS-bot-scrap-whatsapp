@@ -84,6 +84,44 @@ function sortIssuesByPriority(issues) {
   });
 }
 
+async function routeFixForIssue(jid, issue, finalData) {
+  switch (issue.code) {
+    case 'MISSING_DESTINATARIO':
+      await safeSendMessage(jid, { text: "❌ Error al guardar: Falta el campo obligatorio: \n\n• Destinatario\n\nPor favor, elige un destinatario de la lista o crea uno nuevo." });
+      await showAllDestinatariosList(jid, finalData);
+      return;
+
+    case 'INVALID_MONTO':
+      setUserState(jid, STATES.AWAITING_MONTO_MODIFICATION, { finalStructuredData: finalData });
+      await safeSendMessage(jid, { text: "❌ Error al guardar: El monto es inválido.\n\nPor favor, escribe el nuevo monto (solo números):\n\nEjemplo: 14935\n\nEscribe 0 para cancelar." });
+      return;
+
+    case 'INVALID_FECHA':
+      setUserState(jid, STATES.AWAITING_FECHA_MODIFICATION, { finalStructuredData: finalData });
+      await safeSendMessage(jid, { text: "❌ Error al guardar: La fecha falta o no es válida.\n\nEscribe la fecha en formato dd/mm/yyyy:\n\nEjemplo: 15/08/2025\n\nEscribe 0 para cancelar." });
+      return;
+
+    case 'INVALID_TIPO_MOV':
+      setUserState(jid, STATES.AWAITING_TIPO_MOVIMIENTO_MODIFICATION, { finalStructuredData: finalData });
+      await safeSendMessage(jid, { text: "❌ Error al guardar: Falta el tipo de movimiento.\n\nIndica el tipo:\n\n1. ingreso\n2. egreso\n\nEscribe 0 para cancelar." });
+      return;
+
+    case 'INVALID_MEDIO_PAGO':
+      await safeSendMessage(jid, { text: "❌ Error al guardar: El método de pago no es válido.\n\nSelecciona uno existente o crea uno nuevo:" });
+      await showAllMetodosPagoList(jid, finalData); // esto setea AWAITING_MEDIO_PAGO_SELECTION
+      return;
+
+    case 'MISSING_CUENTA_CONTABLE':
+      setUserState(jid, STATES.AWAITING_CUENTA_CONTABLE_MODIFICATION, { finalStructuredData: finalData });
+      await safeSendMessage(jid, { text: "ℹ️ Sugerencia: Puedes indicar la cuenta contable (dueño):\n\n1. Erica Romina Dávila\n2. Nicolás Olave\n0. Omitir" });
+      return;
+
+    default:
+      await safeSendMessage(jid, { text: "❌ Error al guardar: Datos incompletos. Intenta ajustar los campos y vuelve a guardar." });
+      return;
+  }
+}
+
 async function ensureRequiredFieldsOrRoute(jid, finalData) {
   try {
     const issues = await validateFinalData(finalData);
@@ -97,7 +135,14 @@ async function ensureRequiredFieldsOrRoute(jid, finalData) {
       text: `⚠️ Faltan datos para continuar:\n\n${list}\n\nTe guiaré para corregir el primero.`
     });
 
-    await routeFixForIssue(jid, mainIssue, finalData);
+    if (typeof routeFixForIssue === 'function') {
+      await routeFixForIssue(jid, mainIssue, finalData);
+    } else {
+      // Fallback crítico: al menos mostrar lista si el problema es método de pago
+      if (mainIssue.code === 'INVALID_MEDIO_PAGO') {
+        await showAllMetodosPagoList(jid, finalData);
+      }
+    }
     return true;
   } catch (e) {
     console.log('⚠️ Error en ensureRequiredFieldsOrRoute:', e?.message || String(e));
@@ -237,6 +282,7 @@ async function resumeSessionIfExists(userId) {
 
   return true;
 }
+
 
 function cleanAmount(raw) {
   if (raw == null || raw === '') return 'No especificado';
@@ -2268,45 +2314,6 @@ async function isMetodoPagoValido(nombre) {
     return metodos.some(m => m.name.toLowerCase() === nombre.toLowerCase());
   } catch {
     return false;
-  }
-}
-
-async function routeFixForIssue(jid, issue, finalData) {
-  switch (issue.code) {
-    case 'MISSING_DESTINATARIO':
-      await safeSendMessage(jid, { text: "❌ Error al guardar: Falta el campo obligatorio: \n\n• Destinatario\n\nPor favor, elige un destinatario de la lista o crea uno nuevo." });
-      await showAllDestinatariosList(jid, finalData);
-      return;
-
-    case 'INVALID_MONTO':
-      setUserState(jid, STATES.AWAITING_MONTO_MODIFICATION, { finalStructuredData: finalData });
-      await safeSendMessage(jid, { text: "❌ Error al guardar: El monto es inválido.\n\nPor favor, escribe el nuevo monto (solo números):\n\nEjemplo: 14935\n\nEscribe 0 para cancelar." });
-      return;
-
-    case 'INVALID_FECHA':
-      setUserState(jid, STATES.AWAITING_FECHA_MODIFICATION, { finalStructuredData: finalData });
-      await safeSendMessage(jid, { text: "❌ Error al guardar: La fecha falta o no es válida.\n\nEscribe la fecha en formato dd/mm/yyyy:\n\nEjemplo: 15/08/2025\n\nEscribe 0 para cancelar." });
-      return;
-
-    case 'INVALID_TIPO_MOV':
-      setUserState(jid, STATES.AWAITING_TIPO_MOVIMIENTO_MODIFICATION, { finalStructuredData: finalData });
-      await safeSendMessage(jid, { text: "❌ Error al guardar: Falta el tipo de movimiento.\n\nIndica el tipo:\n\n1. ingreso\n2. egreso\n\nEscribe 0 para cancelar." });
-      return;
-
-    case 'INVALID_MEDIO_PAGO':
-      await safeSendMessage(jid, { text: "❌ Error al guardar: El método de pago no es válido.\n\nSelecciona uno existente o crea uno nuevo:" });
-      await showAllMetodosPagoList(jid, finalData);
-      return;
-
-    case 'MISSING_CUENTA_CONTABLE':
-      // Recomendación, no bloqueante
-      setUserState(jid, STATES.AWAITING_CUENTA_CONTABLE_MODIFICATION, { finalStructuredData: finalData });
-      await safeSendMessage(jid, { text: "ℹ️ Sugerencia: Puedes indicar la cuenta contable (dueño):\n\n1. Erica Romina Dávila\n2. Nicolás Olave\n0. Omitir" });
-      return;
-
-    default:
-      await safeSendMessage(jid, { text: "❌ Error al guardar: Datos incompletos. Intenta ajustar los campos y vuelve a guardar." });
-      return;
   }
 }
 
