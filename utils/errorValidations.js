@@ -1,34 +1,22 @@
+const getMetodosPago = require('../getMetodosPago.js');
 
+// Normaliza cadenas: trim, lower, sin tildes y sin separadores comunes
 function norm(s) {
   return String(s || '')
     .trim()
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')   // quita acentos
-    .replace(/[\s\-_.]/g, '');         // quita separadores comunes
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\s\-_.]/g, '');
 }
-async function isKnownMedioPago(name) {
-  if (!name) return false;
-  try {
-    const metodos = await getMetodosPago();
-    if (!Array.isArray(metodos) || metodos.length === 0) return false;
 
-    const target = norm(name);
-    return metodos.some(m => norm(m.name) === target);
-  } catch {
-    return false;
-  }
+function cleanAmount(raw) {
+  if (raw == null || raw === '') return 'No especificado';
+  if (typeof raw === 'number') return raw;
+  const num = parseFloat(String(raw).replace(/[^0-9.,-]/g, '').replace(',', '.'));
+  return isNaN(num) ? raw : num;
 }
-function isValidTipoMovimiento(s) {
-  if (!s) return false;
-  const v = String(s).trim().toLowerCase();
-  return v === 'ingreso' || v === 'egreso';
-}
-function normalizeTipoMovimiento(s) {
-  if (!s) return null;
-  const v = String(s).trim().toLowerCase();
-  return v === 'ingreso' ? 'ingreso' : v === 'egreso' ? 'egreso' : null;
-}
+
 function isValidDateDDMMYYYY(s) {
   if (typeof s !== 'string') return false;
   const m = s.match(/^\s*(\d{1,2})\/(\d{1,2})\/(\d{4})\s*$/);
@@ -37,26 +25,29 @@ function isValidDateDDMMYYYY(s) {
   const dt = new Date(y, mo, d);
   return dt.getFullYear() === y && dt.getMonth() === mo && dt.getDate() === d;
 }
+
+function normalizeTipoMovimiento(s) {
+  if (!s) return null;
+  const v = String(s).trim().toLowerCase();
+  return v === 'ingreso' ? 'ingreso' : v === 'egreso' ? 'egreso' : null;
+}
+
 function isPositiveNumber(n) {
   return typeof n === 'number' && isFinite(n) && n > 0;
 }
+
+// Tolerante a tildes y separadores
 async function isKnownMedioPago(name) {
   if (!name) return false;
   try {
     const metodos = await getMetodosPago();
-    return metodos.some(m => m.name.toLowerCase() === String(name).toLowerCase());
+    if (!Array.isArray(metodos) || metodos.length === 0) return false;
+    const target = norm(name);
+    return metodos.some(m => norm(m.name) === target);
   } catch {
     return false;
   }
 }
-
-function cleanAmount(raw) {
-  if (raw == null || raw === '') return 'No especificado';
-  if (typeof raw === 'number') return raw;
-  const num = parseFloat(String(raw).replace(/[^0-9.,-]/g,'').replace(',','.'));
-  return isNaN(num) ? raw : num;
-}
-
 
 // Devuelve lista de issues: [{ code, field, message }]
 async function validateFinalData(fd) {
@@ -89,7 +80,7 @@ async function validateFinalData(fd) {
     issues.push({ code: 'INVALID_MEDIO_PAGO', field: 'medio_pago', message: 'El método de pago falta o no es válido.' });
   }
 
-  // Cuenta contable (recomendado, no bloqueante)
+  // Cuenta contable (opcional)
   if (!fd?.cuenta_contable) {
     issues.push({ code: 'MISSING_CUENTA_CONTABLE', field: 'cuenta_contable', message: 'Cuenta contable no establecida (opcional).' });
   }
@@ -98,10 +89,9 @@ async function validateFinalData(fd) {
 }
 
 module.exports = {
-  isValidTipoMovimiento,
-  normalizeTipoMovimiento,
-  isValidDateDDMMYYYY,
-  isPositiveNumber,
+  validateFinalData,
   isKnownMedioPago,
-  validateFinalData
-}
+  cleanAmount,
+  normalizeTipoMovimiento,
+  isValidDateDDMMYYYY
+};

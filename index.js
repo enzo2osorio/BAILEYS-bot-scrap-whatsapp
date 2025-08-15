@@ -36,6 +36,15 @@ const getMetodosPago = require('./utils/getMetodosPago.js');
 const saveNewDestinatario = require('./utils/saveNewDestinatario.js');
 const matchMetodoPago = require('./utils/findMatchMetodoPago.js');
 const { startMongoConnectionMonitor } = require('./utils/mongo/monitor-mongo.js')
+const checkSimilarDestinatario = require("./utils/checkSimilarDestinatario.js");
+const saveDestinatarioAliases = require("./utils/saveDestinatarioAliases.js");
+const checkDuplicateAliases = require("./utils/checkDuplicateAliases.js");
+const { closeClient, getClient } = require("./utils/mongo/singleton-mongo.js");
+const { saveTempSessionDB, getTempSession, clearTempSession, listRecentSessions } = require("./utils/mongo/temporal-sessions.js");
+const { cuentaLinkExists, createCuentaContableLink } = require("./utils/destinatarios/resolveCuentaContableDescripcion.js");
+const { getOwnerIdByNameStrict } = require("./utils/destinatarios/getOwnerIdByName.js");
+const { getMetodoPagoIdByNameStrict } = require("./utils/destinatarios/getMetodoPagoIdByName.js");
+const { validateFinalData, isKnownMedioPago, cleanAmount } = require("./utils/errorValidations.js");
 
 dotenv.config();
 
@@ -84,100 +93,48 @@ function sortIssuesByPriority(issues) {
   });
 }
 
-
-function norm(s) {
-  return String(s || '')
-    .trim()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')   // quita acentos
-    .replace(/[\s\-_.]/g, '');         // quita separadores comunes
+async function proceedToFinalConfirmationDirect(jid, data) {
+  const ensured = await ensureCuentaFields(data);
+  const normalized = normalizeDateTime(ensured);
+  await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
+  setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, { finalStructuredData: normalized });
+  await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized)}` });
 }
-async function isKnownMedioPago(name) {
-  if (!name) return false;
-  try {
-    const metodos = await getMetodosPago();
-    if (!Array.isArray(metodos) || metodos.length === 0) return false;
-
-    const target = norm(name);
-    return metodos.some(m => norm(m.name) === target);
-  } catch {
-    return false;
-  }
-}
-function isValidTipoMovimiento(s) {
-  if (!s) return false;
-  const v = String(s).trim().toLowerCase();
-  return v === 'ingreso' || v === 'egreso';
-}
-function normalizeTipoMovimiento(s) {
-  if (!s) return null;
-  const v = String(s).trim().toLowerCase();
-  return v === 'ingreso' ? 'ingreso' : v === 'egreso' ? 'egreso' : null;
-}
-function isValidDateDDMMYYYY(s) {
-  if (typeof s !== 'string') return false;
-  const m = s.match(/^\s*(\d{1,2})\/(\d{1,2})\/(\d{4})\s*$/);
-  if (!m) return false;
-  const d = parseInt(m[1], 10), mo = parseInt(m[2], 10) - 1, y = parseInt(m[3], 10);
-  const dt = new Date(y, mo, d);
-  return dt.getFullYear() === y && dt.getMonth() === mo && dt.getDate() === d;
-}
-function isPositiveNumber(n) {
-  return typeof n === 'number' && isFinite(n) && n > 0;
-}
-async function isKnownMedioPago(name) {
-  if (!name) return false;
-  try {
-    const metodos = await getMetodosPago();
-    return metodos.some(m => m.name.toLowerCase() === String(name).toLowerCase());
-  } catch {
-    return false;
-  }
-}
-
-function cleanAmount(raw) {
-  if (raw == null || raw === '') return 'No especificado';
-  if (typeof raw === 'number') return raw;
-  const num = parseFloat(String(raw).replace(/[^0-9.,-]/g,'').replace(',','.'));
-  return isNaN(num) ? raw : num;
-}
-
 
 async function routeFixForIssue(jid, issue, finalData) {
   switch (issue.code) {
     case 'MISSING_DESTINATARIO':
-      await safeSendMessage(jid, { text: "❌ Error al guardar: Falta el campo obligatorio: \n\n• Destinatario\n\nPor favor, elige un destinatario de la lista o crea uno nuevo." });
+      await safeSendMessage(jid, { text: "❌ Error al guardar: Falta el campo obligatorio destinatario.\n\nElige uno de la lista o crea uno nuevo." });
       await showAllDestinatariosList(jid, finalData);
       return;
 
     case 'INVALID_MONTO':
       setUserState(jid, STATES.AWAITING_MONTO_MODIFICATION, { finalStructuredData: finalData });
-      await safeSendMessage(jid, { text: "❌ Error al guardar: El monto es inválido.\n\nPor favor, escribe el nuevo monto (solo números):\n\nEjemplo: 14935\n\nEscribe 0 para cancelar." });
+      await safeSendMessage(jid, { text: "❌ Error al guardar: El monto es inválido.\n\nEscribe el nuevo monto (solo números):\nEj: 14935\n\nEscribe 0 para cancelar." });
       return;
 
     case 'INVALID_FECHA':
       setUserState(jid, STATES.AWAITING_FECHA_MODIFICATION, { finalStructuredData: finalData });
-      await safeSendMessage(jid, { text: "❌ Error al guardar: La fecha falta o no es válida.\n\nEscribe la fecha en formato dd/mm/yyyy:\n\nEjemplo: 15/08/2025\n\nEscribe 0 para cancelar." });
+      await safeSendMessage(jid, { text: "❌ Error al guardar: La fecha falta o no es válida.\n\nFormato: dd/mm/yyyy\nEj: 15/08/2025\n\nEscribe 0 para cancelar." });
       return;
 
     case 'INVALID_TIPO_MOV':
       setUserState(jid, STATES.AWAITING_TIPO_MOVIMIENTO_MODIFICATION, { finalStructuredData: finalData });
-      await safeSendMessage(jid, { text: "❌ Error al guardar: Falta el tipo de movimiento.\n\nIndica el tipo:\n\n1. ingreso\n2. egreso\n\nEscribe 0 para cancelar." });
+      await safeSendMessage(jid, { text: "❌ Error al guardar: Falta el tipo de movimiento.\n\nResponde:\n1. ingreso\n2. egreso\n\n0. Cancelar" });
       return;
 
     case 'INVALID_MEDIO_PAGO':
       await safeSendMessage(jid, { text: "❌ Error al guardar: El método de pago no es válido.\n\nSelecciona uno existente o crea uno nuevo:" });
-      await showAllMetodosPagoList(jid, finalData); // esto setea AWAITING_MEDIO_PAGO_SELECTION
+      await showAllMetodosPagoList(jid, finalData); // Estado: AWAITING_MEDIO_PAGO_SELECTION
       return;
 
     case 'MISSING_CUENTA_CONTABLE':
       setUserState(jid, STATES.AWAITING_CUENTA_CONTABLE_MODIFICATION, { finalStructuredData: finalData });
-      await safeSendMessage(jid, { text: "ℹ️ Sugerencia: Puedes indicar la cuenta contable (dueño):\n\n1. Erica Romina Dávila\n2. Nicolás Olave\n0. Omitir" });
+      await safeSendMessage(jid, { text: "ℹ️ Opcional: Indica la cuenta contable (dueño):\n\n1. Erica Romina Dávila\n2. Nicolás Olave\n0. Omitir" });
       return;
 
     default:
-      await safeSendMessage(jid, { text: "❌ Error al guardar: Datos incompletos. Intenta ajustar los campos y vuelve a guardar." });
+      await safeSendMessage(jid, { text: "❌ Error al guardar: Datos incompletos. Ajusta los campos y vuelve a guardar." });
       return;
   }
 }
@@ -344,13 +301,6 @@ async function resumeSessionIfExists(userId) {
 }
 
 
-function cleanAmount(raw) {
-  if (raw == null || raw === '') return 'No especificado';
-  if (typeof raw === 'number') return raw;
-  const num = parseFloat(String(raw).replace(/[^0-9.,-]/g,'').replace(',','.'));
-  return isNaN(num) ? raw : num;
-}
-
 function formatFinalConfirmation(data, updated = false) {
   const montoVal = cleanAmount(data.monto);
   const montoStr = (typeof montoVal === 'number') ? `$${montoVal}` : (String(montoVal).startsWith('$') ? montoVal : `$${montoVal}`);
@@ -475,15 +425,7 @@ const server = require("http").createServer(app);
 const io = require("socket.io")(server);
 const port = process.env.PORT || 8000;
 const qrcode = require("qrcode");
-const checkSimilarDestinatario = require("./utils/checkSimilarDestinatario.js");
-const saveDestinatarioAliases = require("./utils/saveDestinatarioAliases.js");
-const checkDuplicateAliases = require("./utils/checkDuplicateAliases.js");
-const { closeClient, getClient } = require("./utils/mongo/singleton-mongo.js");
-const { saveTempSessionDB, getTempSession, clearTempSession, listRecentSessions } = require("./utils/mongo/temporal-sessions.js");
-const { cuentaLinkExists, createCuentaContableLink } = require("./utils/destinatarios/resolveCuentaContableDescripcion.js");
-const { getOwnerIdByNameStrict } = require("./utils/destinatarios/getOwnerIdByName.js");
-const { getMetodoPagoIdByNameStrict } = require("./utils/destinatarios/getMetodoPagoIdByName.js");
-const { validateFinalData } = require("./utils/errorValidations.js");
+
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
 
@@ -1073,36 +1015,31 @@ const graceful = async (signal) => {
   process.exit(0);
 };
 
-function showAllMetodosPagoList(jid, structuredData) {
-  return (async () => {
-    try {
-      const metodosPago = await getMetodosPago();
+async function showAllMetodosPagoList(jid, structuredData) {
+  try {
+    const metodosPago = await getMetodosPago();
 
-      if (metodosPago.length === 0) {
-        await safeSendMessage(jid, { text: "❌ No hay métodos de pago registrados. Crea uno nuevo con la opción 1." });
-      }
-
-      let metodosList = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
-      metodosPago.forEach((metodo, index) => {
-        metodosList += `${index + 2}. ${metodo.name}\n`;
-      });
-
-      // Guardar estado con los métodos disponibles
-      setUserState(jid, STATES.AWAITING_MEDIO_PAGO_SELECTION, {
-        structuredData,
-        allMetodosPago: metodosPago,
-        originalData: structuredData
-      });
-
-      await safeSendMessage(jid, {
-        text: `💳 Lista de métodos de pago:\n\n${metodosList}\nEscribe el número del método de pago que corresponde:`
-      });
-    } catch (error) {
-      console.error("Error en showAllMetodosPagoList:", error);
-      await safeSendMessage(jid, { text: "❌ Error mostrando la lista de métodos de pago." });
-      clearUserState(jid);
+    if (!Array.isArray(metodosPago) || metodosPago.length === 0) {
+      await safeSendMessage(jid, { text: "❌ No hay métodos de pago registrados. Escribe 1 para crear uno nuevo." });
     }
-  })();
+
+    let metodosList = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
+    metodosPago.forEach((metodo, index) => {
+      metodosList += `${index + 2}. ${metodo.name}\n`;
+    });
+
+    setUserState(jid, STATES.AWAITING_MEDIO_PAGO_SELECTION, {
+      structuredData,
+      allMetodosPago: metodosPago
+    });
+
+    await safeSendMessage(jid, {
+      text: `💳 Lista de métodos de pago:\n\n${metodosList}\nEscribe el número de tu opción:`
+    });
+  } catch (error) {
+    console.error("Error en showAllMetodosPagoList:", error);
+    await safeSendMessage(jid, { text: "❌ Error mostrando la lista de métodos de pago." });
+  }
 }
 
 async function routeMetodoPagoByScore(jid, structuredData, proceedFn, showListFn) {
@@ -2165,8 +2102,8 @@ Responde únicamente con el JSON, sin texto adicional.
             const finalBaseData = { ...baseDataWithCuenta, nombre: acceptedDestName };
 
             // Ruta método de pago (maneja confirmación/lista/auto y dispara confirmación final si procede)
-           const proceed = await routeMetodoPagoByScore(jid, finalBaseData, proceedToFinalConfirmationWithMetodoPago, showAllMetodosPagoList);
-            if (!proceed) return; // se quedó pidiendo confirmación/lista
+            const proceed = await routeMetodoPagoByScore(jid, finalBaseData, proceedToFinalConfirmationWithMetodoPago, showAllMetodosPagoList);
+            if (!proceed) return;
 
           } catch (error) {
             console.error("❌ Error en processInitialMessage:", error.message);
@@ -2260,12 +2197,12 @@ const showAllDestinatariosList = async (jid, structuredData, opts = {}) => {
 
 
 
-const handleMedioPagoSelection = async (jid, textMessage, userState, quotedMsg) => {
-  const option = parseInt(textMessage.trim());
-  console.log(`🔍 AWAITING_MEDIO_PAGO_SELECTION -> opción: ${option}`);
-
-  const allMetodosPago = userState.data.allMetodosPago || [];
+async function handleMedioPagoSelection(jid, textMessage, userState, quotedMsg) {
+  const option = parseInt(textMessage.trim(), 10);
+  const allMetodosPago = userState?.data?.allMetodosPago || [];
   const maxOption = allMetodosPago.length + 1;
+
+  console.log(`🔍 AWAITING_MEDIO_PAGO_SELECTION -> opción: ${option}, max: ${maxOption}`);
 
   if (isNaN(option) || option < 0 || option > maxOption) {
     await safeSendMessage(jid, { text: `⚠️ Por favor, escribe un número válido (0 a ${maxOption}).` });
@@ -2279,20 +2216,23 @@ const handleMedioPagoSelection = async (jid, textMessage, userState, quotedMsg) 
   }
 
   if (option === 1) {
-    await startNewMetodoPagoFlow(jid, userState.data.structuredData);
+    // Reutiliza tu flujo actual para crear método de pago (si ya existe, llama esa función)
+    setUserState(jid, STATES.AWAITING_NEW_METODO_PAGO_NAME, {
+      structuredData: userState.data.structuredData
+    });
+    await safeSendMessage(jid, { text: "💳 Escribe el nombre del nuevo método de pago:" });
     return;
   }
 
-  const selectedIndex = option - 2;
-  const selectedMetodoPago = allMetodosPago[selectedIndex];
-  if (!selectedMetodoPago) {
+  const selected = allMetodosPago[option - 2];
+  if (!selected) {
     await safeSendMessage(jid, { text: "⚠️ Opción no válida. Intenta nuevamente." });
     return;
   }
 
-  console.log(`✅ Método de pago seleccionado: ${selectedMetodoPago.name}`);
-  await proceedToFinalConfirmationWithMetodoPago(jid, selectedMetodoPago.name, userState.data.structuredData);
-};
+  console.log(`✅ Método de pago seleccionado: ${selected.name}`);
+  await proceedToFinalConfirmationWithMetodoPago(jid, selected.name, userState.data.structuredData);
+}
 
 const startNewMetodoPagoFlow = async (jid, structuredData) => {
   setUserState(jid, STATES.AWAITING_NEW_METODO_PAGO_NAME, {
@@ -2414,7 +2354,8 @@ const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, str
     return;
   }
 
-  const valido = await isMetodoPagoValido(metodoPagoName);
+  // Validar existencia de medio de pago solo para decidir si mostrar lista ahora
+  const valido = await isKnownMedioPago(metodoPagoName);
   if (!valido) {
     console.log(`⚠️ Método de pago no válido: "${metodoPagoName}". Pidiendo selección manual.`);
     await safeSendMessage(jid, { text: `💳 No se reconoció el método de pago "${metodoPagoName}". Selecciona uno existente o crea uno nuevo:` });
@@ -2426,14 +2367,11 @@ const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, str
   const withCuenta = await ensureCuentaFields(withMetodo);
   const finalData = normalizeDateTime(withCuenta);
 
-  // NUEVO: Validación previa con prioridad. Si falta algo, redirige y no muestra confirmación aún.
-  const routed = await ensureRequiredFieldsOrRoute(jid, finalData);
-  if (routed) return;
-
   await saveTempSession(jid, finalData, 'AWAITING_SAVE_CONFIRMATION');
   setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
     finalStructuredData: finalData
   });
+
   await safeSendMessage(jid, { text: `${formatFinalConfirmation(finalData)}` });
 };
 
@@ -2960,30 +2898,16 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
   // 💾 Guardar comprobante final
 const saveComprobante = async (jid, userData) => {
   try {
-    // 1) Normalizar y asegurar "cuenta" descriptiva
-    const ensured = await ensureCuentaFields(userData.finalStructuredData || {});
-    const normalized = normalizeDateTime(ensured);
-
-    // 2) Validación previa detallada
+    const normalized = normalizeDateTime(await ensureCuentaFields(userData.finalStructuredData || {}));
     const issues = await validateFinalData(normalized);
 
-    // Mostrar un resumen rápido si hay varios problemas
-    const blocking = issues.filter(i => i.code !== 'MISSING_CUENTA_CONTABLE'); // cuenta_contable no bloquea
-    if (blocking.length > 0) {
-      // Tomar el primero como principal y enrutar al fix
-      const summary = blocking.map(i => `• ${i.message}`).join('\n');
+    if (issues.length > 0) {
+      const summary = issues.map(i => `• ${i.message}`).join('\n');
       await safeSendMessage(jid, { text: `⚠️ No se pudo guardar por los siguientes motivos:\n\n${summary}\n\nTe guiaré para corregir el primero.` });
-      await routeFixForIssue(jid, blocking[0], normalized);
+      await routeFixForIssue(jid, issues[0], normalized);
       return;
     }
 
-    // Si solo falta cuenta_contable, sugerir pero permitir guardar
-    const onlyCuentaMissing = issues.length === 1 && issues[0].code === 'MISSING_CUENTA_CONTABLE';
-    if (onlyCuentaMissing) {
-      await safeSendMessage(jid, { text: "ℹ️ Nota: No se indicó la cuenta contable (dueño). Puedes agregarla desde Modificar > Cuenta contable. Guardando de todos modos..." });
-    }
-
-    // 3) Guardado
     const result = await saveDataFirstFlow({
       ...normalized,
       fecha: normalized.fecha,
@@ -2998,31 +2922,27 @@ const saveComprobante = async (jid, userData) => {
       return;
     }
 
-    // 4) Manejo de errores de BD (detalle)
     const err = result?.error;
     let userErrMsg = "❌ Error guardando el comprobante. Intenta más tarde.";
     if (err) {
       const msg = (err.message || '').toLowerCase();
       const code = String(err.code || '');
       if (code === '23502' || msg.includes('null value')) {
-        userErrMsg = "❌ Error al guardar: hay campos obligatorios sin completar. Revisa tipo de movimiento, fecha y monto.";
+        userErrMsg = "❌ Error al guardar: hay campos obligatorios sin completar (monto, fecha o tipo).";
       } else if (code === '23505' || msg.includes('duplicate')) {
         userErrMsg = "❌ Ya existe un comprobante similar. Verifica que no sea un duplicado.";
-      } else if (msg.includes('foreign key') || msg.includes('violates foreign key')) {
-        userErrMsg = "❌ Error de referencia: el destinatario o método de pago seleccionado no existe.";
-      } else if (msg.includes('timeout') || msg.includes('network')) {
-        userErrMsg = "❌ Problema temporal de red o base de datos. Intenta nuevamente en unos minutos.";
+      } else if (msg.includes('foreign key')) {
+        userErrMsg = "❌ Error de referencia: el destinatario o método de pago no existe.";
       }
     }
     await safeSendMessage(jid, { text: userErrMsg });
-    // Ofrecer volver al menú de modificación para ajustar
     await showModificationMenu(jid, { finalStructuredData: normalized });
   } catch (error) {
     console.error("❌ Error guardando comprobante (excepción):", error);
     await safeSendMessage(jid, { text: "❌ Error interno al guardar el comprobante. Intenta más tarde." });
     clearUserState(jid);
   }
-};
+}
 
   // 📝 Mostrar menú de modificación
   const showModificationMenu = async (jid, userData) => {
@@ -3270,27 +3190,20 @@ const saveComprobante = async (jid, userData) => {
   await proceedToFinalConfirmationFromModification(jid, updatedData);
 };
 
-  // ✅ Volver a confirmación final desde modificación
+ // 4) Arreglar proceedToFinalConfirmationFromModification (sin validar aquí)
 const proceedToFinalConfirmationFromModification = async (jid, finalData) => {
   console.log('🔧 Datos recibidos en proceedToFinalConfirmationFromModification:', finalData);
 
   const ensured = await ensureCuentaFields(finalData);
   const normalized = normalizeDateTime(ensured);
 
-  // Validación previa con prioridad en modificación también
-  const routed = await ensureRequiredFieldsOrRoute(jid, normalized);
-  if (routed) return;
-
   await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
   setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
     finalStructuredData: normalized
   });
 
-  await safeSendMessage(jid, {
-    text: `${formatFinalConfirmation(normalized, true)}`
-  });
+  await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized, true)}` });
 };
-
 }
 
 async function downloadDocumentMessage(message, senderName, messageId) {
