@@ -1,4 +1,5 @@
 const supabase = require("./supabase");
+const { getOwnerIdByNameStrict } = require("./utils/destinatarios/getOwnerIdByName");
 
 function toTimestampFromPayload({ fecha, hora, fecha_iso }) {
   if (typeof fecha_iso === 'string' && !Number.isNaN(Date.parse(fecha_iso))) {
@@ -30,7 +31,8 @@ async function saveDataFirstFlow(params) {
     fecha_iso,
     tipo_movimiento,
     medio_pago,
-    observacion
+    observacion, 
+    cuenta_contable
   } = params;
 
   // Destinatario
@@ -56,16 +58,38 @@ async function saveDataFirstFlow(params) {
     return { error: "No existe el medio de pago." };
   }
 
-  const {data: cuenta_contable, error, cuentaError} = await supabase
-  .from("metodo_pago_destinatario_duenos")
-  .select("id")
-  .eq("destinatario_id", destinatario.id)
-  .eq("metodo_pago_id", existingMedioPago.id)
-  .single()
+  let cuentaContableId = null;
 
-  if (cuentaError || !cuenta_contable) {
-    return { error: "No existe la cuenta contable." };
+  try {
+    if (cuenta_contable && typeof cuenta_contable === 'string') {
+      const ownerId = await getOwnerIdByNameStrict(cuenta_contable);
+      if (ownerId) {
+        const { data: cuentaLink, error: errCuenta } = await supabase
+          .from("metodo_pago_destinatario_duenos")
+          .select("id")
+          .eq("dueno_id", ownerId)               // <- por dueño
+          .eq("metodo_pago_id", existingMedioPago.id) // <- y método
+          .maybeSingle?.() || { data: null, error: null }; // compatibilidad si maybeSingle no existe
+
+        if (errCuenta) {
+          console.log("⚠️ Error consultando cuenta contable:", errCuenta.message || errCuenta);
+        }
+        if (cuentaLink && cuentaLink.id) {
+          cuentaContableId = cuentaLink.id;
+        } else {
+          // No encontrada: no bloquear el guardado
+          console.log(`ℹ️ Cuenta contable no encontrada para: ${medio_pago} de ${cuenta_contable} (guardando sin vínculo)`);
+        }
+      } else {
+        console.log(`ℹ️ Dueño no resuelto para cuenta_contable="${cuenta_contable}" (guardando sin vínculo)`);
+      }
+    }
+  } catch (e) {
+    console.log("⚠️ Error resolviendo cuenta contable:", e?.message || String(e));
   }
+
+
+
 
   // Fecha/timestamp seguro
   const ts = toTimestampFromPayload({ fecha, hora, fecha_iso });
@@ -81,7 +105,7 @@ async function saveDataFirstFlow(params) {
       origen: "bot",
       metodo_pago_id: existingMedioPago.id,
       descripcion: observacion ?? null,
-      cuenta_contable_id: cuenta_contable.id,
+      cuenta_contable_id: cuentaContableId,
       created_at: new Date().toISOString()
     })
     .select()

@@ -891,6 +891,20 @@ async function showDestinatariosListView(jid) {
   }
 }
 
+// 📝 Iniciar flujo de nuevo destinatario
+  const startNewDestinatarioFlow = async (jid, structuredData) => {
+    setUserState(jid, STATES.AWAITING_NEW_DESTINATARIO_NAME, {
+      structuredData: structuredData.isModification ? null : structuredData,
+      finalStructuredData: structuredData.isModification ? structuredData : null,
+      isModification: structuredData.isModification || false,
+      originalData: structuredData
+    });
+
+    await safeSendMessage(jid, {
+      text: "🆕 Vamos a crear un nuevo destinatario.\n\nEscribe el nombre canónico del destinatario:"
+    });
+  };
+
 async function handleCmdDestinatariosSelection(jid, textMessage, userState) {
   const option = parseInt(textMessage.trim(), 10);
   const allDestinatarios = userState.data.allDestinatarios || [];
@@ -981,8 +995,8 @@ async function showCuentasListView(jid) {
   try {
     const { data, error } = await supabase
       .from('metodo_pago_destinatario_duenos')
-      .select('id, descripcion')
-      .order('descripcion', { ascending: true });
+      .select('id, description')
+      .order('description', { ascending: true });
 
     if (error) {
       console.error("Error obteniendo cuentas:", error);
@@ -2291,19 +2305,6 @@ Responde únicamente con el JSON, sin texto adicional.
           };
 
 
-  // 📝 Iniciar flujo de nuevo destinatario
-  const startNewDestinatarioFlow = async (jid, structuredData) => {
-    setUserState(jid, STATES.AWAITING_NEW_DESTINATARIO_NAME, {
-      structuredData: structuredData.isModification ? null : structuredData,
-      finalStructuredData: structuredData.isModification ? structuredData : null,
-      isModification: structuredData.isModification || false,
-      originalData: structuredData
-    });
-
-    await safeSendMessage(jid, {
-      text: "🆕 Vamos a crear un nuevo destinatario.\n\nEscribe el nombre canónico del destinatario:"
-    });
-  };
 
   // 📋 Mostrar lista completa de destinatarios
 const showAllDestinatariosList = async (jid, structuredData, opts = {}) => {
@@ -2476,7 +2477,7 @@ const handleNewMetodoPagoName = async (jid, textMessage, userState, quotedMsg) =
 
   // 2) Si vino desde el comando "metodo pago", finalizar en idle
   if (userState.data.startedFromCommand === 'metodo') {
-    await safeSendMessage(jid, { text: "✅ Listo. Escribe \"metodo pago\" para ver la lista nuevamente o 0 para cerrar." });
+    await safeSendMessage(jid, { text: "✅ Listo. Si quieres ver la lista actualizada, escribe \"metodo pago\" otra vez." });
     clearUserState(jid);
     return;
   }
@@ -4003,13 +4004,6 @@ const getAllChats = () => {
     console.error("Error obteniendo chats:", error);
     return [];
   }
-};
-
-// Función para obtener el JID de tu propio número (para chat contigo mismo)
-const getMyJid = () => {
-  const myNumber = "";
-  console.log({ myNumber });
-  return myNumber;
 };
 
 

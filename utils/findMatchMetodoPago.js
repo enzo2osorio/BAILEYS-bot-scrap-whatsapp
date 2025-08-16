@@ -24,9 +24,6 @@ const matchMetodoPago = async (inputMetodoPago) => {
     // Comparar con cada método de pago usando fuzzball
     for (const metodoPago of metodosPago) {
       const score = fuzz.ratio(inputMetodoPago.toLowerCase(), metodoPago.name.toLowerCase());
-      
-      console.log(`  🔍 "${metodoPago.name}" → Score: ${score}%`);
-      
       if (score > bestMatch.score) {
         bestMatch = {
           name: metodoPago.name,
