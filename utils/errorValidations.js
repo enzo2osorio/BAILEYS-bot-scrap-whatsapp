@@ -83,7 +83,7 @@ async function validateFinalData(fd) {
 
   // Cuenta contable (opcional)
   if (!fd?.cuenta_contable) {
-    issues.push({ code: 'MISSING_CUENTA_CONTABLE', field: 'cuenta_contable', message: 'Cuenta contable no establecida (opcional).' });
+    issues.push({ code: 'MISSING_CUENTA_CONTABLE', field: 'cuenta_contable', message: 'Cuenta contable no establecida.' });
   }
 
   return issues;

@@ -93,13 +93,6 @@ function sortIssuesByPriority(issues) {
   });
 }
 
-async function proceedToFinalConfirmationDirect(jid, data) {
-  const ensured = await ensureCuentaFields(data);
-  const normalized = normalizeDateTime(ensured);
-  await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
-  setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, { finalStructuredData: normalized });
-  await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized)}` });
-}
 
 async function routeFixForIssue(jid, issue, finalData) {
   switch (issue.code) {
@@ -139,33 +132,6 @@ async function routeFixForIssue(jid, issue, finalData) {
   }
 }
 
-async function ensureRequiredFieldsOrRoute(jid, finalData) {
-  try {
-    const issues = await validateFinalData(finalData);
-    if (!issues || issues.length === 0) return false;
-
-    const sorted = sortIssuesByPriority(issues);
-    const mainIssue = sorted[0];
-    const list = sorted.map(i => `• ${i.message}`).join('\n');
-
-    await safeSendMessage(jid, {
-      text: `⚠️ Faltan datos para continuar:\n\n${list}\n\nTe guiaré para corregir el primero.`
-    });
-
-    if (typeof routeFixForIssue === 'function') {
-      await routeFixForIssue(jid, mainIssue, finalData);
-    } else {
-      // Fallback crítico: al menos mostrar lista si el problema es método de pago
-      if (mainIssue.code === 'INVALID_MEDIO_PAGO') {
-        await showAllMetodosPagoList(jid, finalData);
-      }
-    }
-    return true;
-  } catch (e) {
-    console.log('⚠️ Error en ensureRequiredFieldsOrRoute:', e?.message || String(e));
-    return false;
-  }
-}
 
 const tempSessionCache = new Map();
 global.tempSessionCache = global.tempSessionCache || new Map();
@@ -408,6 +374,9 @@ const STATES = {
    AWAITING_CREATE_CUENTA_DECISION: "awaiting_create_cuenta_decision",
   AWAITING_CREATE_CUENTA_OWNER_SELECTION: "awaiting_create_cuenta_owner_selection",
   AWAITING_CREATE_CUENTA_METODO_PAGO_SELECTION: "awaiting_create_cuenta_metodo_pago_selection",
+  AWAITING_CMD_DESTINATARIO_LIST: "awaiting_cmd_destinatario_list",
+  AWAITING_CMD_METODO_PAGO_LIST: "awaiting_cmd_metodo_pago_list",
+  AWAITING_CMD_CUENTAS_LIST: "awaiting_cmd_cuentas_list",
 };
 
 const { session } = { session: "session_auth_info" };
@@ -867,6 +836,210 @@ async function recoverFrom428() {
   }
 }
 
+async function showDestinatariosListView(jid) {
+  try {
+    const { data: destinatariosRaw, error } = await supabase
+      .from('destinatarios')
+      .select('id,name,category_id,subcategory_id')
+      .order('name');
+    if (error) {
+      console.error("Error obteniendo destinatarios:", error);
+      await safeSendMessage(jid, { text: "❌ Error obteniendo la lista de destinatarios." });
+      return;
+    }
+    if (!destinatariosRaw || destinatariosRaw.length === 0) {
+      await safeSendMessage(jid, { text: "📋 No hay destinatarios. Puedes crear uno nuevo con la opción 1." });
+    }
+
+    const { blocks, indexMap } = await buildCategorizedDestinatariosMessage(destinatariosRaw, {
+      includeIds: false,
+      codePrefix: 'D'
+    });
+
+    const linear = [];
+    const seen = new Set();
+    for (const dest of indexMap.values()) {
+      if (!seen.has(dest.id)) {
+        linear.push(dest);
+        seen.add(dest.id);
+      }
+    }
+
+    setUserState(jid, STATES.AWAITING_CMD_DESTINATARIO_LIST, {
+      allDestinatarios: linear
+    });
+
+    let counter = 2;
+    const renumber = (text) => text.replace(/(^|\n)(\s*)D(\d+)\.\s/g, (_, br, sp) => {
+      const line = `${br}${sp}${counter}. `;
+      counter++;
+      return line;
+    });
+
+    const transformed = blocks.map(renumber);
+
+    await safeSendMessage(jid, {
+      text: `📋 Destinatarios:\n\n0. ❌ Cancelar\n1. ➕ Nuevo destinatario\n\n${transformed[0] || ''}`
+    });
+    for (let i = 1; i < transformed.length; i++) {
+      await safeSendMessage(jid, { text: transformed[i] });
+    }
+    await safeSendMessage(jid, { text: "👉 Escribe el número (0/1 para cancelar/crear)." });
+  } catch (e) {
+    console.error("Error en showDestinatariosListView:", e);
+    await safeSendMessage(jid, { text: "❌ Error mostrando destinatarios." });
+  }
+}
+
+async function handleCmdDestinatariosSelection(jid, textMessage, userState) {
+  const option = parseInt(textMessage.trim(), 10);
+  const allDestinatarios = userState.data.allDestinatarios || [];
+  const maxOption = allDestinatarios.length + 1;
+
+  if (isNaN(option) || option < 0 || option > maxOption) {
+    await safeSendMessage(jid, { text: `⚠️ Número inválido (0 a ${maxOption}).` });
+    return;
+  }
+
+  if (option === 0) {
+    await safeSendMessage(jid, { text: "✅ Listado cerrado." });
+    clearUserState(jid);
+    return;
+  }
+
+  if (option === 1) {
+    // Crear nuevo destinatario desde comando (flag startedFromCommand)
+    await startNewDestinatarioFlow(jid, { isModification: false, startedFromCommand: 'destinatarios' });
+    return;
+  }
+
+  const idx = option - 2;
+  const selected = allDestinatarios[idx];
+  if (!selected) {
+    await safeSendMessage(jid, { text: "⚠️ Opción fuera de rango." });
+    return;
+  }
+  await safeSendMessage(jid, { text: `👤 Seleccionaste: ${selected.name}\n\nEscribe "destinatarios" para ver la lista nuevamente o 0 para cerrar.` });
+}
+
+
+async function showMetodosPagoListView(jid) {
+  try {
+    const metodosPago = await getMetodosPago();
+    if (!Array.isArray(metodosPago) || metodosPago.length === 0) {
+      await safeSendMessage(jid, { text: "📋 No hay métodos de pago. Usa 1 para crear uno nuevo." });
+    }
+
+    let list = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
+    metodosPago.forEach((m, i) => { list += `${i + 2}. ${m.name}\n`; });
+
+    setUserState(jid, STATES.AWAITING_CMD_METODO_PAGO_LIST, {
+      allMetodosPago: metodosPago
+    });
+
+    await safeSendMessage(jid, { text: `💳 Métodos de pago:\n\n${list}\nEscribe el número:` });
+  } catch (e) {
+    console.error("Error en showMetodosPagoListView:", e);
+    await safeSendMessage(jid, { text: "❌ Error mostrando métodos de pago." });
+  }
+}
+
+async function handleCmdMetodosPagoSelection(jid, textMessage, userState) {
+  const option = parseInt(textMessage.trim(), 10);
+  const all = userState.data.allMetodosPago || [];
+  const maxOption = all.length + 1;
+
+  if (isNaN(option) || option < 0 || option > maxOption) {
+    await safeSendMessage(jid, { text: `⚠️ Número inválido (0 a ${maxOption}).` });
+    return;
+  }
+
+  if (option === 0) {
+    await safeSendMessage(jid, { text: "✅ Listado cerrado." });
+    clearUserState(jid);
+    return;
+  }
+
+  if (option === 1) {
+    setUserState(jid, STATES.AWAITING_NEW_METODO_PAGO_NAME, {
+      structuredData: null,
+      startedFromCommand: 'metodo'
+    });
+    await safeSendMessage(jid, { text: "💳 Escribe el nombre del nuevo método de pago:" });
+    return;
+  }
+
+  const selected = all[option - 2];
+  if (!selected) {
+    await safeSendMessage(jid, { text: "⚠️ Opción no válida." });
+    return;
+  }
+  await safeSendMessage(jid, { text: `💳 Seleccionaste: ${selected.name}\n\nEscribe "metodo pago" para ver la lista nuevamente o 0 para cerrar.` });
+}
+
+async function showCuentasListView(jid) {
+  try {
+    const { data, error } = await supabase
+      .from('metodo_pago_destinatario_duenos')
+      .select('id, descripcion')
+      .order('descripcion', { ascending: true });
+
+    if (error) {
+      console.error("Error obteniendo cuentas:", error);
+      await safeSendMessage(jid, { text: "❌ Error obteniendo las cuentas contables." });
+      return;
+    }
+
+    const cuentas = data || [];
+    let list = "0. ❌ Cancelar\n1. ➕ Crear nueva cuenta contable\n";
+    cuentas.forEach((c, i) => { list += `${i + 2}. ${c.descripcion || '(sin descripción)'}\n`; });
+
+    setUserState(jid, STATES.AWAITING_CMD_CUENTAS_LIST, {
+      cuentas
+    });
+
+    await safeSendMessage(jid, { text: `🧾 Cuentas contables registradas:\n\n${list}\nEscribe el número:` });
+  } catch (e) {
+    console.error("Error en showCuentasListView:", e);
+    await safeSendMessage(jid, { text: "❌ Error mostrando cuentas contables." });
+  }
+}
+
+async function handleCmdCuentasListSelection(jid, textMessage, userState) {
+  const option = parseInt(textMessage.trim(), 10);
+  const cuentas = userState.data.cuentas || [];
+  const maxOption = cuentas.length + 1;
+
+  if (isNaN(option) || option < 0 || option > maxOption) {
+    await safeSendMessage(jid, { text: `⚠️ Número inválido (0 a ${maxOption}).` });
+    return;
+  }
+
+  if (option === 0) {
+    await safeSendMessage(jid, { text: "✅ Listado cerrado." });
+    clearUserState(jid);
+    return;
+  }
+
+  if (option === 1) {
+    // Crear nueva cuenta contable: primero dueño, luego método
+    setUserState(jid, STATES.AWAITING_CREATE_CUENTA_OWNER_SELECTION, {
+      structuredData: { startedFromCommand: 'cuentas' }
+    });
+    await safeSendMessage(jid, {
+      text: "🏦 Selecciona el dueño de la cuenta:\n\n1. Erica Romina Dávila\n2. Nicolás Olave\n0. Cancelar"
+    });
+    return;
+  }
+
+  const selected = cuentas[option - 2];
+  if (!selected) {
+    await safeSendMessage(jid, { text: "⚠️ Opción no válida." });
+    return;
+  }
+  await safeSendMessage(jid, { text: `🧾 Cuenta: ${selected.descripcion || '(sin descripción)'}\n\nEscribe "cuentas" para ver la lista nuevamente o 0 para cerrar.` });
+}
+
 
 // 📨 FUNCIONES PARA MENSAJES (botones eliminados, solo texto ahora)
 // Función para limpiar sesiones corruptas
@@ -1240,10 +1413,21 @@ const msgRetryCounterCache = new NodeCache();
           // 📝 MANEJO DE MENSAJES DE TEXTO SEGÚN ESTADO
           if (messageType === "conversation" || messageType === "extendedTextMessage") {
       
-            if (userState.state === STATES.IDLE && /^lista$/i.test(textMessage.trim())) {
-              await showAllDestinatariosList(jid, { });
+            if (userState.state === STATES.IDLE) {
+            const cmd = (textMessage || '').trim().toLowerCase();
+            if (cmd === 'destinatarios') {
+              await showDestinatariosListView(jid);
               continue;
             }
+            if (cmd === 'metodo pago') { // frase exacta
+              await showMetodosPagoListView(jid);
+              continue;
+            }
+            if (cmd === 'cuentas') {
+              await showCuentasListView(jid);
+              continue;
+            }
+          }
 
            if (userState.state === STATES.AWAITING_DESTINATARIO_CHOOSING_IN_LIST_OR_ADDING_NEW) {
              await handleChoosingInListOrAddingNew(jid, textMessage, userState, msg);
@@ -1341,6 +1525,18 @@ const msgRetryCounterCache = new NodeCache();
             }
             if (userState.state === STATES.AWAITING_CREATE_CUENTA_METODO_PAGO_SELECTION) {
               await handleCuentaLinkMetodoPagoSelection(jid, textMessage, userState);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_CMD_DESTINATARIO_LIST) {
+              await handleCmdDestinatariosSelection(jid, textMessage, userState, msg);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_CMD_METODO_PAGO_LIST) {
+              await handleCmdMetodosPagoSelection(jid, textMessage, userState, msg);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_CMD_CUENTAS_LIST) {
+              await handleCmdCuentasListSelection(jid, textMessage, userState, msg);
               continue;
             }
           }
@@ -1811,13 +2007,9 @@ async function handleCreateCuentaDecision(jid, textMessage, userState) {
 async function handleCreateCuentaOwnerSelection(jid, textMessage, userState) {
   const option = parseInt(textMessage.trim());
   if (option === 0) {
-    // Cancelar y volver a confirmación final sin crear
-    const normalized = normalizeDateTime(userState.data.structuredData);
-    await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
-    setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
-      finalStructuredData: normalized
-    });
-    await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized)}` });
+    const normalized = normalizeDateTime(userState.data.structuredData || {});
+    await safeSendMessage(jid, { text: "✅ Operación cancelada." });
+    clearUserState(jid);
     return;
   }
   if (isNaN(option) || option < 1 || option > 2) {
@@ -1826,7 +2018,11 @@ async function handleCreateCuentaOwnerSelection(jid, textMessage, userState) {
   }
 
   const selectedOwner = option === 1 ? "Erica Romina Dávila" : "Nicolás Olave";
-  const updated = { ...userState.data.structuredData, cuenta_contable: selectedOwner };
+  const updated = {
+    ...(userState.data.structuredData || {}),
+    cuenta_contable: selectedOwner,
+    startedFromCommand: userState.data.structuredData?.startedFromCommand // conservar flag si venía desde "cuentas"
+  };
   await showMetodosPagoForCuentaLink(jid, updated);
 }
 
@@ -1847,7 +2043,8 @@ async function showMetodosPagoForCuentaLink(jid, structuredData) {
     setUserState(jid, STATES.AWAITING_CREATE_CUENTA_METODO_PAGO_SELECTION, {
       structuredData,
       availableMetodosPago: metodosPago,
-      accountLinkFlow: true // bandera para reutilizar creación de método
+      accountLinkFlow: true,
+      startedFromCommand: structuredData.startedFromCommand || null
     });
 
     await safeSendMessage(jid, {
@@ -1858,13 +2055,8 @@ async function showMetodosPagoForCuentaLink(jid, structuredData) {
     });
   } catch (error) {
     console.error("Error en showMetodosPagoForCuentaLink:", error);
-    // fallback a confirmación sin crear
-    const normalized = normalizeDateTime(structuredData);
-    await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
-    setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
-      finalStructuredData: normalized
-    });
-    await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized)}` });
+    await safeSendMessage(jid, { text: "❌ Error mostrando métodos de pago." });
+    clearUserState(jid);
   }
 }
 
@@ -1875,12 +2067,8 @@ async function handleCuentaLinkMetodoPagoSelection(jid, textMessage, userState) 
   const maxOption = metodosPago.length + 1;
 
   if (option === 0) {
-    const normalized = normalizeDateTime(userState.data.structuredData);
-    await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
-    setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
-      finalStructuredData: normalized
-    });
-    await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized)}` });
+    await safeSendMessage(jid, { text: "✅ Operación cancelada." });
+    clearUserState(jid);
     return;
   }
 
@@ -1894,7 +2082,8 @@ async function handleCuentaLinkMetodoPagoSelection(jid, textMessage, userState) 
     setUserState(jid, STATES.AWAITING_NEW_METODO_PAGO_NAME, {
       structuredData: userState.data.structuredData,
       originalData: userState.data.structuredData,
-      accountLinkFlow: true // bandera
+      accountLinkFlow: true,
+      startedFromCommand: userState.data.startedFromCommand || null
     });
     await safeSendMessage(jid, { text: "💳 Escribe el nombre del nuevo método de pago:" });
     return;
@@ -1904,27 +2093,31 @@ async function handleCuentaLinkMetodoPagoSelection(jid, textMessage, userState) 
   const ownerName = userState.data.structuredData.cuenta_contable;
   const metodoName = selectedMetodo.name;
 
-  // Crear vínculo en Supabase
   const ownerId = await getOwnerIdByNameStrict(ownerName);
   const metodoId = await getMetodoPagoIdByNameStrict(metodoName);
   if (!ownerId || !metodoId) {
     await safeSendMessage(jid, { text: "❌ No se pudo resolver IDs para crear la cuenta. Intenta más tarde." });
-    const normalized = normalizeDateTime(userState.data.structuredData);
-    await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
-    setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, { finalStructuredData: normalized });
-    await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized)}` });
+    clearUserState(jid);
     return;
   }
 
   const descripcion = `${metodoName} de ${ownerName}`;
   const created = await createCuentaContableLink(ownerId, metodoId, descripcion);
   if (!created) {
-    await safeSendMessage(jid, { text: "❌ Error creando la cuenta contable. Continuamos sin crear." });
-  } else {
-    await safeSendMessage(jid, { text: `✅ Cuenta creada: ${descripcion}` });
+    await safeSendMessage(jid, { text: "❌ Error creando la cuenta contable." });
+    clearUserState(jid);
+    return;
   }
 
-  // Actualizar datos y volver a confirmación
+  // Si vino desde el comando "cuentas", no ir a confirmación del comprobante
+  if (userState.data.startedFromCommand === 'cuentas') {
+    await safeSendMessage(jid, { text: `✅ Cuenta creada: ${descripcion}` });
+    clearUserState(jid);
+    return;
+  }
+  
+
+  // Flujo normal (previo): volver a confirmación del comprobante
   const withMetodo = { ...userState.data.structuredData, medio_pago: metodoName };
   const withCuenta = await ensureCuentaFields(withMetodo);
   const normalized = normalizeDateTime(withCuenta);
@@ -1933,20 +2126,6 @@ async function handleCuentaLinkMetodoPagoSelection(jid, textMessage, userState) 
   setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, { finalStructuredData: normalized });
   await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized, true)}` });
 }
-
-// --- Arreglar bug y enganchar el flujo de creación si falta la cuenta ---
-async function isMetodoPagoValido(nombre) {
-  if (!nombre) return false;
-  try {
-    const metodos = await getMetodosPago();
-    return metodos.some(m => m.name.toLowerCase() === nombre.toLowerCase());
-  } catch {
-    return false;
-  }
-}
-
-
-
 
 
   // 🧠 Procesar mensaje inicial con OpenAI
@@ -2248,14 +2427,12 @@ const startNewMetodoPagoFlow = async (jid, structuredData) => {
 // 📝 Manejar nombre de nuevo método de pago
 const handleNewMetodoPagoName = async (jid, textMessage, userState, quotedMsg) => {
   const nombreMetodoPago = textMessage.trim();
-  
   if (!nombreMetodoPago) {
     await safeSendMessage(jid, { text: "⚠️ Por favor, ingresa un nombre válido." });
     return;
   }
 
   const newMetodoPago = await saveNewMetodoPago(nombreMetodoPago);
-
   if (!newMetodoPago) {
     await safeSendMessage(jid, { text: "❌ Error guardando el método de pago. Intenta más tarde." });
     clearUserState(jid);
@@ -2264,7 +2441,7 @@ const handleNewMetodoPagoName = async (jid, textMessage, userState, quotedMsg) =
 
   await safeSendMessage(jid, { text: `✅ Método de pago *${nombreMetodoPago}* creado.` });
 
-  // Si venimos del flujo de creación de cuenta, crear vínculo y cerrar
+  // 1) Si venía del flujo de CUENTAS (accountLinkFlow), crear vínculo o terminar en modo comando
   if (userState.data.accountLinkFlow) {
     const ownerName = userState.data.structuredData?.cuenta_contable;
     const metodoId = newMetodoPago.id;
@@ -2272,38 +2449,42 @@ const handleNewMetodoPagoName = async (jid, textMessage, userState, quotedMsg) =
 
     if (!ownerId) {
       await safeSendMessage(jid, { text: "❌ No se pudo resolver el dueño para crear la cuenta." });
-      const normalized = normalizeDateTime(userState.data.structuredData);
-      await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
-      setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, { finalStructuredData: normalized });
-      await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized)}` });
+      clearUserState(jid);
       return;
     }
 
     const descripcion = `${nombreMetodoPago} de ${ownerName}`;
     const created = await createCuentaContableLink(ownerId, metodoId, descripcion);
-    if (created) {
-      await safeSendMessage(jid, { text: `✅ Cuenta creada: ${descripcion}` });
-    } else {
-      await safeSendMessage(jid, { text: "❌ No se pudo crear la cuenta. Continuamos sin crear." });
+
+    if (userState.data.startedFromCommand === 'cuentas') {
+      if (created) await safeSendMessage(jid, { text: `✅ Cuenta creada: ${descripcion}` });
+      else await safeSendMessage(jid, { text: "❌ No se pudo crear la cuenta." });
+      clearUserState(jid);
+      return;
     }
 
+    // Flujo original
+    if (created) await safeSendMessage(jid, { text: `✅ Cuenta creada: ${descripcion}` });
     const withMetodo = { ...userState.data.structuredData, medio_pago: nombreMetodoPago };
     const withCuenta = await ensureCuentaFields(withMetodo);
     const normalized = normalizeDateTime(withCuenta);
-
     await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
     setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, { finalStructuredData: normalized });
     await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized, true)}` });
     return;
   }
 
-  // Caso original (modificación o flujo normal)
+  // 2) Si vino desde el comando "metodo pago", finalizar en idle
+  if (userState.data.startedFromCommand === 'metodo') {
+    await safeSendMessage(jid, { text: "✅ Listo. Escribe \"metodo pago\" para ver la lista nuevamente o 0 para cerrar." });
+    clearUserState(jid);
+    return;
+  }
+
+  // 3) Caso modificación o flujo normal (existente)
   const isModification = userState.data.isModification || userState.data.finalStructuredData;
   if (isModification) {
-    const updatedData = {
-      ...userState.data.finalStructuredData,
-      medio_pago: nombreMetodoPago
-    };
+    const updatedData = { ...userState.data.finalStructuredData, medio_pago: nombreMetodoPago };
     await proceedToFinalConfirmationFromModification(jid, updatedData);
   } else {
     await proceedToFinalConfirmationWithMetodoPago(jid, nombreMetodoPago, userState.data.structuredData);
@@ -2867,6 +3048,12 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
   // Verificar si estamos en modo modificación
   const isModification = userData.isModification || userData.finalStructuredData;
   
+  if (!isModification && userData.startedFromCommand === 'destinatarios') {
+    await safeSendMessage(jid, { text: "✅ Destinatario creado." });
+    clearUserState(jid);
+    return;
+  }
+
   if (isModification) {
     // Actualizar destinatario en los datos existentes para modificación
     const updatedData = {
@@ -2923,7 +3110,7 @@ const saveComprobante = async (jid, userData) => {
     }
 
     const err = result?.error;
-    let userErrMsg = "❌ Error guardando el comprobante. Intenta más tarde.";
+    let userErrMsg = `❌ Error guardando el comprobante. Intenta más tarde. ${result.error ? result.error : ""}`;
     if (err) {
       const msg = (err.message || '').toLowerCase();
       const code = String(err.code || '');

@@ -56,6 +56,17 @@ async function saveDataFirstFlow(params) {
     return { error: "No existe el medio de pago." };
   }
 
+  const {data: cuenta_contable, error, cuentaError} = await supabase
+  .from("metodo_pago_destinatario_duenos")
+  .select("id")
+  .eq("destinatario_id", destinatario.id)
+  .eq("metodo_pago_id", existingMedioPago.id)
+  .single()
+
+  if (cuentaError || !cuenta_contable) {
+    return { error: "No existe la cuenta contable." };
+  }
+
   // Fecha/timestamp seguro
   const ts = toTimestampFromPayload({ fecha, hora, fecha_iso });
 
@@ -70,6 +81,7 @@ async function saveDataFirstFlow(params) {
       origen: "bot",
       metodo_pago_id: existingMedioPago.id,
       descripcion: observacion ?? null,
+      cuenta_contable_id: cuenta_contable.id,
       created_at: new Date().toISOString()
     })
     .select()
