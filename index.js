@@ -2234,9 +2234,10 @@ Analizar todo el texto recibido y construir un objeto JSON con los siguientes ca
 
 ### Indicaciones clave:
 
-- Lógica especial para **cuenta_contable**: Debes identificar desde qué cuenta (o hacia qué cuenta) se realizó el movimiento y asignarla a una de estas dos personas: "Erica Romina Dávila" o "Nicolás Olave". 
+- Lógica especial para **cuenta_contable**: Debes identificar desde qué cuenta (o hacia qué cuenta) se realizó el movimiento y asignarla a una de estas dos personas: "Erica Romina Dávila" o "Nicolás Olave". SE AGREGA "Caja General" solo para movimientos en efectivo
+- IMPORTANTE: Si en alguna parte del texto se menciona "Efectivo" o sus abreviaciones coloquiales (ef, efec, etc...) La cuenta contable será "Caja General", y por relación, trataremos a la cuenta como "Efectivo desde Caja General", pues el efectivo no se trata por separado, sino que se globaliza como "Caja General".
 - La propiedad **cuenta_contable** se usará para llevar la gestión de movimientos de las cuentas de estas personas, de manera más granular indicando movimientos ya no solo "egresos" o "ingresos", sino ahora podremos señalar (ejemplos) "egreso desde la cuenta de Nicolás Olave", o "ingresos a la cuenta de Erica Romina".
-- Los nombres que podrá entrar en esta propiedad serán estrictamente uno de dos: "Erica Romina Dávila" o "Nicolás Olave".
+- Los nombres que podrá entrar en esta propiedad serán estrictamente uno de tres: "Erica Romina Dávila", "Nicolás Olave" o "Caja General" (en la mayoría de casos se usará los dos primeros).
 
 - **"tipo_movimiento"** puede ser solo: "ingreso" o "egreso".
   
@@ -2253,6 +2254,7 @@ Analizar todo el texto recibido y construir un objeto JSON con los siguientes ca
 - Si en alguna parte del texto se menciona "pago", "pagaste a", "transferencia" o similares, es probable que sea un **egreso**.
 - Si en alguna parte del texto se relaciona fuertemente "pagador" con "Olave" o "Davila", es probable que sea un **egreso**.
 - Si en alguna parte del texto se menciona "devolución", "reembolso" o similares, es probable que sea un **ingreso**.
+
 
 > Estos criterios no son absolutos: en algunos casos puede haber excepciones.
 
