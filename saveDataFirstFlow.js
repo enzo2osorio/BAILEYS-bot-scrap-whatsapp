@@ -59,7 +59,28 @@ async function saveDataFirstFlow(params) {
     return { error: "No existe el medio de pago." };
   }
 
-  let cuentaContableId = await getCuentaContable(cuenta_contable, existingMedioPago);
+  //hallando el owner ID
+
+  const {data: ownerData, error: ownerError} = await supabase
+  .from("destinatarios")
+  .select("id")
+  .eq("name", cuenta_contable)
+  .single();
+
+  if (ownerError || !ownerData) {
+    console.log("⚠️ Error obteniendo ownerId:", ownerError?.message || ownerError);
+    return null;
+  }
+
+  const ownerId = ownerData.id;
+
+  //hallando la cuenta contable
+  const cuentaContableId = await getCuentaContable(ownerId, existingMedioPago);
+  if (!cuentaContableId) {
+    return { error: "No se pudo encontrar la cuenta contable." };
+  }
+
+
 
   // Fecha/timestamp seguro
   const ts = toTimestampFromPayload({ fecha, hora, fecha_iso });
