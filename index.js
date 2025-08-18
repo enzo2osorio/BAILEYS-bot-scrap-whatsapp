@@ -294,12 +294,135 @@ async function ensureCuentaFields(structured) {
 
   try {
     const linkInfo = await cuentaLinkExists(owner, metodo);
-    const desc = linkInfo?.descripcion || (metodo && owner ? `${metodo} de ${owner}` : null);
+    // Compatibilidad: si es string, úsalo; si es objeto, usa description
+    const desc = typeof linkInfo === 'string'
+      ? linkInfo
+      : (linkInfo?.description || (metodo && owner ? `${metodo} de ${owner}` : null));
     return { ...structured, cuenta: desc || structured.cuenta || null };
   } catch {
     return { ...structured, cuenta: (metodo && owner ? `${metodo} de ${owner}` : structured.cuenta || null) };
   }
 }
+
+async function showCuentaLinksForModification(jid, userData) {
+  try {
+    const combos = await listCuentaLinksWithNames();
+    if (!combos.length) {
+      // No hay combos -> crear nueva (dueños dinámicos)
+      await showOwnersDueñosForCuentaLink(jid, {
+        structuredData: userData.finalStructuredData,
+        returnAfterAccountCreation: true
+      });
+      return;
+    }
+
+    let list = "0. ❌ Cancelar\n1. ➕ Crear nueva cuenta contable\n";
+    combos.forEach((c, i) => { list += `${i + 2}. ${c.label}\n`; });
+
+    setUserState(jid, STATES.AWAITING_CUENTA_LINK_MODIFICATION, {
+      finalStructuredData: userData.finalStructuredData,
+      availableCuentaLinks: combos
+    });
+
+    await safeSendMessage(jid, { text: `🏦 Selecciona la cuenta contable:\n\n${list}\nEscribe el número:` });
+  } catch (e) {
+    console.error("Error en showCuentaLinksForModification:", e);
+    await safeSendMessage(jid, { text: "❌ Error mostrando cuentas contables." });
+    await proceedToFinalConfirmationFromModification(jid, userData.finalStructuredData);
+  }
+}
+
+async function showOwnersDueñosForCuentaLink(jid, context = {}) {
+  const owners = await getOwnersDuenos();
+  if (!owners.length) {
+    await safeSendMessage(jid, { text: "❌ No hay dueños registrados. Crea un destinatario con categoría 'administradores' y subcategoría 'dueños del negocio'." });
+    clearUserState(jid);
+    return;
+  }
+
+  let list = "0. ❌ Cancelar\n";
+  owners.forEach((o, i) => { list += `${i + 1}. ${o.name}\n`; });
+
+  setUserState(jid, STATES.AWAITING_CREATE_CUENTA_OWNER_SELECTION_DYNAMIC, {
+    structuredData: context.structuredData || null,
+    owners,
+    returnAfterAccountCreation: !!context.returnAfterAccountCreation,
+    startedFromCommand: context.startedFromCommand || null
+  });
+
+  await safeSendMessage(jid, { text: `🏦 Selecciona el dueño de la cuenta:\n\n${list}\nEscribe el número:` });
+}
+
+async function handleCuentaLinkModificationSelection(jid, textMessage, userState) {
+  const option = parseInt(textMessage.trim(), 10);
+  const combos = userState?.data?.availableCuentaLinks || [];
+  const maxOption = combos.length + 1;
+
+  if (isNaN(option) || option < 0 || option > maxOption) {
+    await safeSendMessage(jid, { text: `⚠️ Número inválido (0 a ${maxOption}).` });
+    return;
+  }
+
+  if (option === 0) {
+    await proceedToFinalConfirmationFromModification(jid, userState.data.finalStructuredData);
+    return;
+  }
+
+  if (option === 1) {
+    // Crear nueva cuenta: dueños dinámicos
+    await showOwnersDueñosForCuentaLink(jid, {
+      structuredData: userState.data.finalStructuredData,
+      returnAfterAccountCreation: true
+    });
+    return;
+  }
+
+  const selected = combos[option - 2];
+  if (!selected) {
+    await safeSendMessage(jid, { text: "⚠️ Opción fuera de rango." });
+    return;
+  }
+
+  const updated = {
+    ...userState.data.finalStructuredData,
+    medio_pago: selected.metodo_name,
+    cuenta_contable: selected.owner_name
+  };
+
+  const withCuenta = await ensureCuentaFields(updated);
+  await safeSendMessage(jid, { text: `✅ Cuenta contable actualizada a: ${selected.label}` });
+  await proceedToFinalConfirmationFromModification(jid, withCuenta);
+}
+
+async function handleCreateCuentaOwnerSelectionDynamic(jid, textMessage, userState) {
+  const option = parseInt(textMessage.trim(), 10);
+  const owners = userState?.data?.owners || [];
+
+  if (option === 0) {
+    if (userState.data.returnAfterAccountCreation && userState.data.structuredData) {
+      await proceedToFinalConfirmationFromModification(jid, userState.data.structuredData);
+    } else {
+      await safeSendMessage(jid, { text: "✅ Operación cancelada." });
+      clearUserState(jid);
+    }
+    return;
+  }
+
+  if (isNaN(option) || option < 1 || option > owners.length) {
+    await safeSendMessage(jid, { text: `⚠️ Escribe un número válido (0 a ${owners.length}).` });
+    return;
+  }
+
+  const selectedOwner = owners[option - 1];
+  const updated = {
+    ...(userState.data.structuredData || {}),
+    cuenta_contable: selectedOwner.name,
+    startedFromCommand: userState.data.startedFromCommand || null
+  };
+
+  await showMetodosPagoForCuentaLink(jid, updated);
+}
+
 
 
 async function resumeAllSessionsAfter428() {
@@ -348,6 +471,9 @@ function scheduleReconnect(ms = 10000) {
   }, ms);
 }
 
+const OWNERS_CATEGORY_ID = '0ba7b565-e067-4411-9061-caa7d4f6ac83';       // administradores
+const OWNERS_SUBCATEGORY_ID = '0d4fad94-6106-49e9-832e-3c94548996a7';   // dueños del negocio
+
 // Estados posibles del flujo
 const STATES = {
   IDLE: "idle",
@@ -365,6 +491,9 @@ const STATES = {
   AWAITING_NEW_CATEGORY_NAME: "awaiting_new_category_name",
   AWAITING_NEW_SUBCATEGORY_NAME: "awaiting_new_subcategory_name",
   AWAITING_NEW_SUBCATEGORY_CATEGORY_SELECTION: "awaiting_new_subcategory_category_selection",
+
+  AWAITING_CUENTA_LINK_MODIFICATION: "awaiting_cuenta_link_modification",
+  AWAITING_CREATE_CUENTA_OWNER_SELECTION_DYNAMIC: "awaiting_create_cuenta_owner_selection_dynamic",
 
   AWAITING_MEDIO_PAGO_CONFIRMATION: "awaiting_medio_pago_confirmation",
   AWAITING_MEDIO_PAGO_SELECTION: "awaiting_medio_pago_selection",
@@ -401,6 +530,7 @@ const io = require("socket.io")(server);
 const port = process.env.PORT || 8000;
 const qrcode = require("qrcode");
 const { saveNewCategory, saveNewSubcategory } = require("./utils/saveNewCategory&Subcategory.js");
+const { listCuentaLinksWithNames, getOwnersDuenos } = require("./utils/getOwnersDuenos.js");
 
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
@@ -1066,7 +1196,7 @@ async function handleCmdCuentasListSelection(jid, textMessage, userState) {
     await safeSendMessage(jid, { text: "⚠️ Opción no válida." });
     return;
   }
-  await safeSendMessage(jid, { text: `🧾 Cuenta: ${selected.descripcion || '(sin descripción)'}\n\nEscribe "cuentas" para ver la lista nuevamente o 0 para cerrar.` });
+  await safeSendMessage(jid, { text: `🧾 Cuenta: ${selected.description || '(sin descripción)'}\n\nEscribe "cuentas" para ver la lista nuevamente o 0 para cerrar.` });
 }
 
 
@@ -1508,6 +1638,15 @@ const msgRetryCounterCache = new NodeCache();
             }
             if (userState.state === STATES.AWAITING_NEW_SUBCATEGORY_CATEGORY_SELECTION) {
               await handleNewSubcategoryCategorySelection(jid, textMessage, userState);
+              continue;
+            }
+
+            if (userState.state === STATES.AWAITING_CUENTA_LINK_MODIFICATION) {
+              await handleCuentaLinkModificationSelection(jid, textMessage, userState);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_CREATE_CUENTA_OWNER_SELECTION_DYNAMIC) {
+              await handleCreateCuentaOwnerSelectionDynamic(jid, textMessage, userState);
               continue;
             }
 
@@ -1998,31 +2137,6 @@ async function autoResolveDestinatarioName(structuredData, caption) {
   return baseName || null;
 }
 
-async function promptCreateCuentaIfMissing(jid, structuredData) {
-  const ownerName = structuredData.cuenta_contable || null;
-  const metodo = structuredData.medio_pago || null;
-  if (!ownerName || !metodo) return false;
-
-  const { exists } = await cuentaLinkExists(ownerName, metodo);
-  if (exists) return false;
-
-  setUserState(jid, STATES.AWAITING_CREATE_CUENTA_DECISION, {
-    structuredData,
-    ownerName,
-    metodo
-  });
-
-  await safeSendMessage(jid, {
-    text:
-      `❓ No encontré una cuenta contable registrada para:\n` +
-      `🏦 ${metodo} de ${ownerName}\n\n` +
-      `¿Deseas crearla ahora?\n\n` +
-      `1. Sí, crear ahora\n` +
-      `2. No, continuar sin crear\n\n` +
-      `Escribe el número de tu opción:`
-  });
-  return true;
-}
 
 async function handleCreateCuentaDecision(jid, textMessage, userState) {
   const option = parseInt(textMessage.trim());
@@ -2156,21 +2270,32 @@ async function handleCuentaLinkMetodoPagoSelection(jid, textMessage, userState) 
 
   const descripcion = `${metodoName} de ${ownerName}`;
   const created = await createCuentaContableLink(ownerId, metodoId, descripcion);
+
   if (!created) {
     await safeSendMessage(jid, { text: "❌ Error creando la cuenta contable." });
     clearUserState(jid);
     return;
   }
 
-  // Si vino desde el comando "cuentas", no ir a confirmación del comprobante
-  if (userState.data.startedFromCommand === 'cuentas') {
+  // Duplicado detectado
+  if (created.existed) {
+    if (userState.data.startedFromCommand === 'cuentas') {
+      await safeSendMessage(jid, { text: `⚠️ La cuenta ya existe: ${created.description || descripcion}\nNo se creó una nueva.` });
+      clearUserState(jid);
+      return;
+    }
+    // En flujo de comprobante: usarla igualmente
+    await safeSendMessage(jid, { text: `ℹ️ La cuenta ya existía: ${created.description || descripcion}. Se utilizará.` });
+  } else {
     await safeSendMessage(jid, { text: `✅ Cuenta creada: ${descripcion}` });
+  }
+
+  if (userState.data.startedFromCommand === 'cuentas') {
     clearUserState(jid);
     return;
   }
-  
 
-  // Flujo normal (previo): volver a confirmación del comprobante
+  // Flujo comprobante: actualizar y volver a confirmación
   const withMetodo = { ...userState.data.structuredData, medio_pago: metodoName };
   const withCuenta = await ensureCuentaFields(withMetodo);
   const normalized = normalizeDateTime(withCuenta);
@@ -3274,20 +3399,20 @@ const saveComprobante = async (jid, userData) => {
 
   // 📝 Mostrar menú de modificación
   const showModificationMenu = async (jid, userData) => {
-    setUserState(jid, STATES.AWAITING_MODIFICATION_SELECTION, userData);
-
-      await safeSendMessage(jid, {
-      text: `📝 ¿Qué deseas modificar?\n\n` +
+  setUserState(jid, STATES.AWAITING_MODIFICATION_SELECTION, userData);
+  await safeSendMessage(jid, {
+    text:
+      `📝 ¿Qué deseas modificar?\n\n` +
       `0. ❌ Cancelar\n` +
       `1. 👤 Destinatario\n` +
       `2. 💰 Monto\n` +
       `3. 📅 Fecha\n` +
       `4. 📊 Tipo de movimiento\n` +
       `5. 💳 Medio de pago\n` +
-      `6. 🏦 Cuenta contable (dueño)\n\n` +
+      `6. 🏦 Cuenta contable (método + dueño)\n\n` +
       `Escribe el número de tu opción:`
-    });
-  };
+  });
+};
 
   // 🔘 Manejar selección de modificación
  const handleModificationSelection = async (jid, textMessage, userState, quotedMsg) => {
@@ -3330,10 +3455,7 @@ const saveComprobante = async (jid, userData) => {
       await showMediosPagoForModification(jid, userState.data);
       break;
     case 6:
-      setUserState(jid, STATES.AWAITING_CUENTA_CONTABLE_MODIFICATION, userState.data);
-      await safeSendMessage(jid, {
-        text: "🏦 Selecciona la cuenta contable (dueño):\n\n1. Erica Romina Dávila\n2. Nicolás Olave\n0. Cancelar"
-      });
+      await showCuentaLinksForModification(jid, userState.data);
       break;
   }
 };
