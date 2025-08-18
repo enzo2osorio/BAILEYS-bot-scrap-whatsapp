@@ -123,7 +123,7 @@ async function routeFixForIssue(jid, issue, finalData) {
 
     case 'MISSING_CUENTA_CONTABLE':
       setUserState(jid, STATES.AWAITING_CUENTA_CONTABLE_MODIFICATION, { finalStructuredData: finalData });
-      await safeSendMessage(jid, { text: "ℹ️ Opcional: Indica la cuenta contable (dueño):\n\n1. Erica Romina Dávila\n2. Nicolás Olave\n0. Omitir" });
+      await safeSendMessage(jid, { text: "ℹ️ Indica la cuenta contable (dueño):\n\n1. Erica Romina Dávila\n2. Nicolás Olave\n0. Omitir" });
       return;
 
     default:
@@ -360,6 +360,12 @@ const STATES = {
   AWAITING_DESTINATARIO_FUZZY_CONFIRMATION: "awaiting_destinatario_fuzzy_confirmation", 
   AWAITING_CATEGORY_SELECTION: "awaiting_category_selection",
   AWAITING_SUBCATEGORY_SELECTION: "awaiting_subcategory_selection",
+  
+  AWAITING_CREATE_CHOICE: "awaiting_create_choice",
+  AWAITING_NEW_CATEGORY_NAME: "awaiting_new_category_name",
+  AWAITING_NEW_SUBCATEGORY_NAME: "awaiting_new_subcategory_name",
+  AWAITING_NEW_SUBCATEGORY_CATEGORY_SELECTION: "awaiting_new_subcategory_category_selection",
+
   AWAITING_MEDIO_PAGO_CONFIRMATION: "awaiting_medio_pago_confirmation",
   AWAITING_MEDIO_PAGO_SELECTION: "awaiting_medio_pago_selection",
     AWAITING_NEW_METODO_PAGO_NAME: "awaiting_new_metodo_pago_name",
@@ -394,6 +400,7 @@ const server = require("http").createServer(app);
 const io = require("socket.io")(server);
 const port = process.env.PORT || 8000;
 const qrcode = require("qrcode");
+const { saveNewCategory, saveNewSubcategory } = require("./utils/saveNewCategory&Subcategory.js");
 
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
@@ -893,17 +900,25 @@ async function showDestinatariosListView(jid) {
 
 // 📝 Iniciar flujo de nuevo destinatario
   const startNewDestinatarioFlow = async (jid, structuredData) => {
-    setUserState(jid, STATES.AWAITING_NEW_DESTINATARIO_NAME, {
-      structuredData: structuredData.isModification ? null : structuredData,
-      finalStructuredData: structuredData.isModification ? structuredData : null,
-      isModification: structuredData.isModification || false,
-      originalData: structuredData
-    });
+  setUserState(jid, STATES.AWAITING_NEW_DESTINATARIO_NAME, {
+    structuredData: structuredData?.isModification ? null : structuredData,
+    finalStructuredData: structuredData?.isModification ? structuredData : null,
+    isModification: structuredData?.isModification || false,
+    originalData: structuredData,
+    creationDraft: {
+      name: null,
+      aliases: [],
+      categoryId: null,
+      categoryName: null,
+      subcategoryId: null,
+      subcategoryName: null
+    }
+  });
 
-    await safeSendMessage(jid, {
-      text: "🆕 Vamos a crear un nuevo destinatario.\n\nEscribe el nombre canónico del destinatario:"
-    });
-  };
+  await safeSendMessage(jid, {
+    text: "🆕 Vamos a crear un nuevo destinatario.\n\nEscribe el nombre canónico del destinatario:"
+  });
+};
 
 async function handleCmdDestinatariosSelection(jid, textMessage, userState) {
   const option = parseInt(textMessage.trim(), 10);
@@ -1006,7 +1021,7 @@ async function showCuentasListView(jid) {
 
     const cuentas = data || [];
     let list = "0. ❌ Cancelar\n1. ➕ Crear nueva cuenta contable\n";
-    cuentas.forEach((c, i) => { list += `${i + 2}. ${c.descripcion || '(sin descripción)'}\n`; });
+    cuentas.forEach((c, i) => { list += `${i + 2}. ${c.description || '(sin descripción)'}\n`; });
 
     setUserState(jid, STATES.AWAITING_CMD_CUENTAS_LIST, {
       cuentas
@@ -1476,6 +1491,23 @@ const msgRetryCounterCache = new NodeCache();
             
             if (userState.state === STATES.AWAITING_SAVE_CONFIRMATION) {
               await handleSaveConfirmation(jid, textMessage, userState, msg);
+              continue;
+            }
+
+             if (userState.state === STATES.AWAITING_CREATE_CHOICE) {
+              await handleCreateChoice(jid, textMessage, userState);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_NEW_CATEGORY_NAME) {
+              await handleNewCategoryName(jid, textMessage, userState);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_NEW_SUBCATEGORY_NAME) {
+              await handleNewSubcategoryName(jid, textMessage, userState);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_NEW_SUBCATEGORY_CATEGORY_SELECTION) {
+              await handleNewSubcategoryCategorySelection(jid, textMessage, userState);
               continue;
             }
 
@@ -2527,6 +2559,90 @@ async function isMetodoPagoValido(nombre) {
 }
 
 
+async function handleCreateChoice(jid, textMessage, userState) {
+  const opt = parseInt(textMessage.trim(), 10);
+  if (isNaN(opt) || opt < 0 || opt > 2) {
+    await safeSendMessage(jid, { text: "⚠️ Escribe 0 (Cancelar), 1 (Nueva categoría) o 2 (Nueva subcategoría)." });
+    return;
+  }
+  if (opt === 0) {
+    // Volver al listado de categorías
+    await proceedToCategorySelection(jid, userState.data, userState.data.creationDraft?.aliases || []);
+    return;
+  }
+  if (opt === 1) {
+    setUserState(jid, STATES.AWAITING_NEW_CATEGORY_NAME, userState.data);
+    await safeSendMessage(jid, { text: "🆕 Escribe el nombre de la nueva categoría:" });
+    return;
+  }
+  // opt === 2
+  setUserState(jid, STATES.AWAITING_NEW_SUBCATEGORY_NAME, userState.data);
+  await safeSendMessage(jid, { text: "🆕 Escribe el nombre de la nueva subcategoría:" });
+}
+
+async function handleNewCategoryName(jid, textMessage, userState) {
+  const name = textMessage.trim();
+  if (!name) {
+    await safeSendMessage(jid, { text: "⚠️ Ingresa un nombre válido para la categoría." });
+    return;
+  }
+  const created = await saveNewCategory(name);
+  if (!created) {
+    await safeSendMessage(jid, { text: "❌ No se pudo crear la categoría." });
+    // Volver a categorías
+  }
+  await safeSendMessage(jid, { text: `✅ Categoría creada: ${name}` });
+  // Volver a lista de categorías
+  await proceedToCategorySelection(jid, userState.data, userState.data.creationDraft?.aliases || []);
+}
+
+async function handleNewSubcategoryName(jid, textMessage, userState) {
+  const tempName = textMessage.trim();
+  if (!tempName) {
+    await safeSendMessage(jid, { text: "⚠️ Ingresa un nombre válido para la subcategoría." });
+    return;
+  }
+  // Elegir la categoría a la que pertenecerá
+  const categorias = await getCategorias();
+  const list = categorias.map((c, i) => `${i + 1}. ${c.name}`).join('\n');
+  setUserState(jid, STATES.AWAITING_NEW_SUBCATEGORY_CATEGORY_SELECTION, {
+    ...userState.data,
+    tempSubcategoryName: tempName,
+    categoriesForNewSubcat: categorias
+  });
+  await safeSendMessage(jid, {
+    text: `📂 ¿A qué categoría pertenecerá "${tempName}"?\n\n0. Cancelar\n${list}\n\nEscribe el número:`
+  });
+}
+
+async function handleNewSubcategoryCategorySelection(jid, textMessage, userState) {
+  const opt = parseInt(textMessage.trim(), 10);
+  const cats = userState.data.categoriesForNewSubcat || [];
+  if (opt === 0) {
+    await proceedToCategorySelection(jid, userState.data, userState.data.creationDraft?.aliases || []);
+    return;
+  }
+  if (isNaN(opt) || opt < 1 || opt > cats.length) {
+    await safeSendMessage(jid, { text: `⚠️ Elige un número válido (0 a ${cats.length}).` });
+    return;
+  }
+  const category = cats[opt - 1];
+  const subName = userState.data.tempSubcategoryName;
+  const created = await saveNewSubcategory(subName, category.id);
+  if (!created) {
+    await safeSendMessage(jid, { text: "❌ No se pudo crear la subcategoría." });
+    await proceedToCategorySelection(jid, userState.data, userState.data.creationDraft?.aliases || []);
+    return;
+  }
+  await safeSendMessage(jid, { text: `✅ Subcategoría creada: ${subName} (en ${category.name})` });
+
+  // Volver a subcategorías para esa categoría
+  const draft = { ...(userState.data.creationDraft || {}), categoryId: category.id, categoryName: category.name };
+  const updated = { ...userState.data, creationDraft: draft };
+  await showSubcategoriesForCategory(jid, updated, category.id, category.name);
+}
+
+
 
 
 const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, structuredData) => {
@@ -2684,75 +2800,119 @@ const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, str
   };
 
 
-  // Reemplazar la función handleNewDestinatarioName (línea ~1275)
-// Reemplazar la función handleNewDestinatarioName
+// Agregar después de handleDestinatarioFuzzyConfirmation
+// 📝 Proceder a solicitar aliases del destinatario
+const proceedToAliasesInput = async (jid, nombreCanonico, userData) => {
+  const draft = { ...(userData.creationDraft || {}), name: nombreCanonico };
+  setUserState(jid, STATES.AWAITING_DESTINATARIO_ALIASES, { ...userData, creationDraft: draft });
+
+  await safeSendMessage(jid, {
+    text:
+      `✅ Nombre guardado: *${nombreCanonico}*\n\n` +
+      `📝 Si deseas, agrega seudónimos separados por coma.\n\n` +
+      `Comandos:\n` +
+      `0. Cancelar\n` +
+      `1. Retroceder (cambiar nombre)\n` +
+      `Escribe "skip" para continuar sin aliases.\n\n` +
+      `Ejemplo: Confitería, Alamos, Los Alamos, Iván Alamos`
+  });
+};
+
+
+const handleDestinatarioAliases = async (jid, textMessage, userState, quotedMsg) => {
+  const input = textMessage.trim();
+  const draft = userState.data.creationDraft || {};
+
+  if (input === "0") {
+    await safeSendMessage(jid, { text: "❌ Operación cancelada." });
+    clearUserState(jid);
+    return;
+  }
+  if (input === "1") {
+    // Retroceder a nombre
+    setUserState(jid, STATES.AWAITING_NEW_DESTINATARIO_NAME, { 
+      ...userState.data, 
+      creationDraft: draft 
+    });
+    await safeSendMessage(jid, { text: "↩️ Escribe el nombre canónico del destinatario:" });
+    return;
+  }
+  if (input.toLowerCase() === "skip") {
+    const updatedDraft = { ...draft, aliases: [] };
+    await proceedToCategorySelection(jid, { ...userState.data, creationDraft: updatedDraft }, []);
+    return;
+  }
+
+  const aliases = input.split(',').map(a => a.trim()).filter(Boolean);
+  if (!aliases.length) {
+    await safeSendMessage(jid, { text: "⚠️ No se detectaron aliases válidos. Usa comas, o escribe 'skip'." });
+    return;
+  }
+
+  const { validAliases, duplicates, errors } = await checkDuplicateAliases(aliases);
+  const updatedDraft = { ...draft, aliases: validAliases };
+
+  let msg = "";
+  if (validAliases.length) msg += `✅ ${validAliases.length} seudónimos válidos:\n• ${validAliases.join('\n• ')}\n\n`;
+  if (duplicates.length) msg += `⚠️ Ya existentes (ignorados):\n• ${duplicates.join('\n• ')}\n\n`;
+  if (errors.length) msg += `❌ Con errores (ignorados):\n• ${errors.join('\n• ')}\n\n`;
+  msg += "Continuando con categorías...";
+  await safeSendMessage(jid, { text: msg });
+
+  await proceedToCategorySelection(jid, { ...userState.data, creationDraft: updatedDraft }, validAliases);
+};
+
+
 const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg) => {
   const nombreCanonico = textMessage.trim();
-  
   if (!nombreCanonico) {
     await safeSendMessage(jid, { text: "⚠️ Por favor, ingresa un nombre válido." });
     return;
   }
 
-  console.log(`🔍 Procesando nuevo destinatario: "${nombreCanonico}"`);
-  
-  // 🎯 VERIFICAR SI EXISTE UN DESTINATARIO SIMILAR
-  const similarMatch = await checkSimilarDestinatario(nombreCanonico);
-  
-  if (similarMatch) {
-    // 🎯 NUEVA LÓGICA: Coincidencia exacta - usar automáticamente
-    if (similarMatch.isExactMatch) {
-      console.log(`🎯 Coincidencia exacta encontrada: ${similarMatch.destinatario.name} - usando automáticamente`);
-      
-      await safeSendMessage(jid, {
-        text: `🎯 El destinatario "*${nombreCanonico}*" ya existe en el sistema.\n\n` +
-        `✅ Se usará el destinatario existente: *${similarMatch.destinatario.name}*\n\n` +
-        `💡 Se realizó una búsqueda en el sistema y se encontró una coincidencia exacta.`
-      });
+  // Actualiza draft con el nombre
+  const draft = { ...(userState.data.creationDraft || {}) , name: nombreCanonico };
+  const newStateData = { ...userState.data, creationDraft: draft };
 
-      // Verificar si estamos en modo modificación
-      const isModification = userState.data.isModification || userState.data.finalStructuredData;
-      
-      if (isModification) {
-        // Actualizar destinatario en modificación
-        const updatedData = {
-          ...userState.data.finalStructuredData,
-          nombre: similarMatch.destinatario.name
-        };
-        console.log('🔧 Destinatario exacto encontrado en modificación:', similarMatch.destinatario.name);
-        await safeSendMessage(jid, { text: `✅ Destinatario actualizado a: ${similarMatch.destinatario.name}` });
-        await proceedToFinalConfirmationFromModification(jid, updatedData);
-      } else {
-        // Flujo normal - proceder a verificar método de pago
-        await proceedToFinalConfirmation(jid, similarMatch.destinatario.name, userState.data.structuredData);
-      }
-      return;
+  console.log(`🔍 Procesando nuevo destinatario: "${nombreCanonico}"`);
+
+  // Coincidencias
+  const similarMatch = await checkSimilarDestinatario(nombreCanonico);
+  if (similarMatch?.isExactMatch) {
+    await safeSendMessage(jid, {
+      text: `🎯 El destinatario "*${nombreCanonico}*" ya existe.\n\nSe usará: *${similarMatch.destinatario.name}*`
+    });
+
+    const isModification = userState.data.isModification || userState.data.finalStructuredData;
+    if (isModification) {
+      const updatedData = { ...userState.data.finalStructuredData, nombre: similarMatch.destinatario.name };
+      await safeSendMessage(jid, { text: `✅ Destinatario actualizado a: ${similarMatch.destinatario.name}` });
+      await proceedToFinalConfirmationFromModification(jid, updatedData);
+    } else {
+      await proceedToFinalConfirmation(jid, similarMatch.destinatario.name, userState.data.structuredData);
     }
-    
-    // 🔍 LÓGICA EXISTENTE: Coincidencia similar - preguntar al usuario
-    console.log(`🔍 Destinatario similar encontrado: ${similarMatch.destinatario.name} (score: ${similarMatch.score})`);
-    
+    return;
+  }
+
+  if (similarMatch) {
     setUserState(jid, STATES.AWAITING_DESTINATARIO_FUZZY_CONFIRMATION, {
-      ...userState.data,
+      ...newStateData,
       nombreCanonicoNuevo: nombreCanonico,
       destinatarioSimilar: similarMatch.destinatario
     });
-    
     await safeSendMessage(jid, {
-      text: `🔍 Revisando todo el listado de destinatarios, he encontrado uno parecido:\n\n` +
-      `*${similarMatch.destinatario.name}*\n\n` +
-      `¿Qué deseas hacer?\n\n` +
-      `1. ✅ Usar "${similarMatch.destinatario.name}"\n` +
-      `2. ➕ Crear nuevo "${nombreCanonico}"\n` +
-      `3. ❌ Cancelar\n\n` +
-      `Escribe el número de tu opción:`
+      text: `🔍 Encontré uno parecido:\n\n` +
+            `*${similarMatch.destinatario.name}*\n\n` +
+            `1. ✅ Usar "${similarMatch.destinatario.name}"\n` +
+            `2. ➕ Crear nuevo "${nombreCanonico}"\n` +
+            `3. ❌ Cancelar\n\n` +
+            `Escribe el número de tu opción:`
     });
-    
-  } else {
-    // No hay destinatarios similares, proceder directamente a pedir aliases
-    console.log(`✅ No hay destinatarios similares, procediendo con: "${nombreCanonico}"`);
-    await proceedToAliasesInput(jid, nombreCanonico, userState.data);
+    return;
   }
+
+  // Pasar a aliases con draft actualizado
+  await proceedToAliasesInput(jid, nombreCanonico, newStateData);
 };
 
    const handleMedioPagoConfirmation = async (jid, textMessage, userState, quotedMsg) => {
@@ -2826,164 +2986,154 @@ const handleDestinatarioFuzzyConfirmation = async (jid, textMessage, userState, 
 };
 
 
-// Agregar después de handleDestinatarioFuzzyConfirmation
-// 📝 Proceder a solicitar aliases del destinatario
-const proceedToAliasesInput = async (jid, nombreCanonico, userData) => {
-  // Actualizar datos con el nombre
-  const updatedData = { 
-    ...userData, 
-    newDestinatarioName: nombreCanonico 
-  };
-
-  setUserState(jid, STATES.AWAITING_DESTINATARIO_ALIASES, updatedData);
-
-  await safeSendMessage(jid, {
-    text: `✅ Nombre guardado: *${nombreCanonico}*\n\n` +
-    `📝 Ahora, si deseas puedes agregar "seudónimos" para *${nombreCanonico}*, escribe los nombres separados por una coma, sigue el siguiente ejemplo:\n\n` +
-    `*Nombre canónico:* Confitería Alamos\n` +
-    `*Aliases:* Confitería, Alamos, Los Alamos, Iván Alamos...\n\n` +
-    `Esto servirá para mejorar la precisión al momento de filtrar los nombres de cada destinatario.\n\n` +
-    `💡 Si no deseas agregar aliases, escribe "skip" o "0" para continuar.`
-  });
-};
 
 
-// Agregar después de proceedToAliasesInput
 // 📝 Manejar entrada de aliases del destinatario
-// Reemplazar la función handleDestinatarioAliases (línea ~1310)
-const handleDestinatarioAliases = async (jid, textMessage, userState, quotedMsg) => {
-  const input = textMessage.trim();
-  
-  // Verificar si el usuario quiere saltarse los aliases
-  if (input.toLowerCase() === "skip" || input === "0") {
-    console.log(`⏭️ Usuario decidió saltarse aliases para: ${userState.data.newDestinatarioName}`);
-    await proceedToCategorySelection(jid, userState.data, []);
-    return;
-  }
-  
-  // Procesar aliases separados por coma
-  const aliases = input.split(',')
-    .map(alias => alias.trim())
-    .filter(alias => alias.length > 0);
-  
-  if (aliases.length === 0) {
-    await safeSendMessage(jid, { 
-      text: "⚠️ No se detectaron aliases válidos. Separa los nombres con comas o escribe 'skip' para continuar sin aliases." 
-    });
-    return;
-  }
-  
-  console.log(`📝 ${aliases.length} aliases procesados para ${userState.data.newDestinatarioName}:`, aliases);
-  
-  // 🔍 VERIFICAR DUPLICADOS ANTES DE GUARDAR
-  const { validAliases, duplicates, errors } = await checkDuplicateAliases(aliases);
-  
-  // Construir mensaje de respuesta
-  let responseMessage = "";
-  
-  if (validAliases.length > 0) {
-    responseMessage += `✅ ${validAliases.length} seudónimos válidos:\n• ${validAliases.join('\n• ')}\n\n`;
-  }
-  
-  if (duplicates.length > 0) {
-    responseMessage += `⚠️ ${duplicates.length} seudónimos ya existen (ignorados):\n• ${duplicates.join('\n• ')}\n\n`;
-  }
-  
-  if (errors.length > 0) {
-    responseMessage += `❌ ${errors.length} seudónimos con errores (ignorados):\n• ${errors.join('\n• ')}\n\n`;
-  }
-  
-  if (validAliases.length === 0) {
-    responseMessage += "⚠️ No hay seudónimos nuevos para agregar.\n\n";
-  }
-  
-  responseMessage += "Continuando con las categorías...";
-  
-  await safeSendMessage(jid, { text: responseMessage });
-  
-  // Proceder a selección de categoría con solo los aliases válidos
-  await proceedToCategorySelection(jid, userState.data, validAliases);
-};
 
 
   // Agregar después de handleDestinatarioAliases
 // 📂 Proceder a selección de categoría con aliases
 const proceedToCategorySelection = async (jid, userData, aliases) => {
-  // Actualizar datos con aliases
-  const updatedData = { 
-    ...userData, 
-    destinatarioAliases: aliases 
-  };
+  const draft = { ...(userData.creationDraft || {}), aliases: aliases || (userData.creationDraft?.aliases || []) };
 
-  setUserState(jid, STATES.AWAITING_CATEGORY_SELECTION, updatedData);
-
-  // Obtener y mostrar categorías
   const categorias = await getCategorias();
-  
-  if (categorias.length === 0) {
-    await safeSendMessage(jid, { text: "❌ No se pudieron cargar las categorías. Intenta más tarde." });
+  if (!categorias.length) {
+    await safeSendMessage(jid, { text: "❌ No se pudieron cargar las categorías." });
     clearUserState(jid);
     return;
   }
 
-  // Crear lista numerada de categorías
-  const categoryList = categorias.map((cat, index) => 
-    `${index + 1}. ${cat.name}`
-  ).join('\n');
+  const list = categorias.map((cat, idx) => `${idx + 3}. ${cat.name}`).join('\n');
+  const payload = { ...userData, creationDraft: draft, availableCategories: categorias };
 
-  // Guardar categorías en el estado para mapear el número luego
-  const updatedDataWithCategories = {
-    ...updatedData,
-    availableCategories: categorias
-  };
-  setUserState(jid, STATES.AWAITING_CATEGORY_SELECTION, updatedDataWithCategories);
-
+  setUserState(jid, STATES.AWAITING_CATEGORY_SELECTION, payload);
   await safeSendMessage(jid, {
-    text: `📂 Elige una categoría escribiendo el número:\n\n${categoryList}\n\nEscribe solo el número de la categoría que deseas.`
+    text:
+      `📂 Elige una categoría:\n\n` +
+      `0. ❌ Cancelar\n` +
+      `1. ➕ Crear (categoría o subcategoría)\n` +
+      `2. ↩️ Retroceder (aliases)\n\n` +
+      `${list}\n\nEscribe el número de tu opción:`
   });
 };
 
-  // � Manejar selección numérica de categoría
-  const handleCategoryNumberSelection = async (jid, textMessage, userState, quotedMsg) => {
-    const categoryNumber = parseInt(textMessage.trim());
-    
-    if (isNaN(categoryNumber) || categoryNumber < 1) {
-      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido de la lista." });
-      return;
-    }
+ const handleCategoryNumberSelection = async (jid, textMessage, userState, quotedMsg) => {
+  const opt = parseInt(textMessage.trim(), 10);
+  const categorias = userState.data.availableCategories || [];
+  const total = categorias.length;
 
-    const categories = userState.data.availableCategories;
-    if (!categories || categoryNumber > categories.length) {
-      await safeSendMessage(jid, { text: "⚠️ Número fuera de rango. Elige un número de la lista." });
-      return;
-    }
+  if (isNaN(opt) || opt < 0 || opt > (total + 2)) {
+    await safeSendMessage(jid, { text: `⚠️ Número inválido (0 a ${total + 2}).` });
+    return;
+  }
 
-    const selectedCategory = categories[categoryNumber - 1];
-    console.log(`✅ Categoría seleccionada: ${selectedCategory.nombre} (ID: ${selectedCategory.id})`);
-    
-    await handleCategorySelection(jid, selectedCategory.id, userState.data);
+  if (opt === 0) {
+    await safeSendMessage(jid, { text: "❌ Operación cancelada." });
+    clearUserState(jid);
+    return;
+  }
+
+  if (opt === 1) {
+    // Submenú: crear categoría o subcategoría
+    setUserState(jid, STATES.AWAITING_CREATE_CHOICE, userState.data);
+    await safeSendMessage(jid, {
+      text: "➕ ¿Qué deseas crear?\n\n1. Nueva categoría\n2. Nueva subcategoría\n0. Cancelar"
+    });
+    return;
+  }
+
+  if (opt === 2) {
+    // Retroceder a aliases
+    setUserState(jid, STATES.AWAITING_DESTINATARIO_ALIASES, userState.data);
+    await safeSendMessage(jid, { text: "↩️ Escribe aliases separados por coma, o 'skip' para continuar." });
+    return;
+  }
+
+  // Selección de categoría (3..)
+  const idx = opt - 3;
+  const selected = categorias[idx];
+  if (!selected) {
+    await safeSendMessage(jid, { text: "⚠️ Opción fuera de rango." });
+    return;
+  }
+
+  const draft = {
+    ...(userState.data.creationDraft || {}),
+    categoryId: selected.id,
+    categoryName: selected.name
   };
 
-  // 🔢 Manejar selección numérica de subcategoría
-   const handleSubcategoryNumberSelection = async (jid, textMessage, userState, quotedMsg) => {
-    const subcategoryNumber = parseInt(textMessage.trim());
-    
-    if (isNaN(subcategoryNumber) || subcategoryNumber < 1) {
-      await safeSendMessage(jid, { text: "⚠️ Por favor, escribe un número válido de la lista." });
-      return;
-    }
+  const updated = { ...userState.data, creationDraft: draft };
+  await showSubcategoriesForCategory(jid, updated, selected.id, selected.name);
+};
 
-    const subcategories = userState.data.availableSubcategories;
-    if (!subcategories || subcategoryNumber > subcategories.length) {
-      await safeSendMessage(jid, { text: "⚠️ Número fuera de rango. Elige un número de la lista." });
-      return;
-    }
+async function showSubcategoriesForCategory(jid, stateData, categoryId, categoryName) {
+  const subcategorias = await getSubcategorias(categoryId);
 
-    const selectedSubcategory = subcategories[subcategoryNumber - 1];
-    console.log(`✅ Subcategoría seleccionada: ${selectedSubcategory.nombre} (ID: ${selectedSubcategory.id})`);
-    
-    await handleSubcategorySelection(jid, selectedSubcategory.id, userState.data);
+  const list = (subcategorias || []).map((s, i) => `${i + 3}. ${s.name}`).join('\n') || "(sin subcategorías)";
+  const payload = { 
+    ...stateData, 
+    availableSubcategories: subcategorias || [],
+    creationDraft: { ...(stateData.creationDraft || {}), categoryId, categoryName }
   };
+
+  setUserState(jid, STATES.AWAITING_SUBCATEGORY_SELECTION, payload);
+  await safeSendMessage(jid, {
+    text:
+      `📁 Subcategorías de ${categoryName}:\n\n` +
+      `0. ❌ Cancelar\n` +
+      `1. ➕ Crear subcategoría\n` +
+      `2. ↩️ Retroceder (categorías)\n\n` +
+      `${list}\n\nEscribe el número de tu opción:`
+  });
+}
+
+  const handleSubcategoryNumberSelection = async (jid, textMessage, userState, quotedMsg) => {
+  const opt = parseInt(textMessage.trim(), 10);
+  const subcats = userState.data.availableSubcategories || [];
+  const total = subcats.length;
+
+  if (isNaN(opt) || opt < 0 || opt > (total + 2)) {
+    await safeSendMessage(jid, { text: `⚠️ Número inválido (0 a ${total + 2}).` });
+    return;
+  }
+
+  if (opt === 0) {
+    await safeSendMessage(jid, { text: "❌ Operación cancelada." });
+    clearUserState(jid);
+    return;
+  }
+
+  if (opt === 1) {
+    // Crear nueva subcategoría: primero el nombre
+    setUserState(jid, STATES.AWAITING_NEW_SUBCATEGORY_NAME, userState.data);
+    await safeSendMessage(jid, { text: "🆕 Escribe el nombre de la nueva subcategoría:" });
+    return;
+  }
+
+  if (opt === 2) {
+    // Retroceder a categorías
+    await proceedToCategorySelection(jid, userState.data, userState.data.creationDraft?.aliases || []);
+    return;
+  }
+
+  const idx = opt - 3;
+  const selected = subcats[idx];
+  if (!selected) {
+    await safeSendMessage(jid, { text: "⚠️ Opción fuera de rango." });
+    return;
+  }
+
+  // Guardar destinatario con draft completo
+  const draft = {
+    ...(userState.data.creationDraft || {}),
+    subcategoryId: selected.id,
+    subcategoryName: selected.name
+  };
+
+  const userData = { ...userState.data, creationDraft: draft };
+  await handleSubcategorySelection(jid, selected.id, userData);
+};
 
   // �📂 Manejar selección de categoría
   const handleCategorySelection = async (jid, categoriaId, userData) => {
@@ -3013,12 +3163,12 @@ const proceedToCategorySelection = async (jid, userData, aliases) => {
   };
 
   // 📁 Manejar selección de subcategoría
-  // Reemplazar la función handleSubcategorySelection (línea ~1350)
 const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
-  // Guardar nuevo destinatario
+  const draft = userData.creationDraft || {};
+  // Guardar nuevo destinatario (usa draft.categoryId/subcategoria)
   const newDestinatario = await saveNewDestinatario(
-    userData.newDestinatarioName,
-    userData.selectedCategoriaId,
+    draft.name,
+    draft.categoryId,
     subcategoriaId
   );
 
@@ -3028,44 +3178,25 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     return;
   }
 
-  console.log(`✅ Destinatario creado: ${userData.newDestinatarioName} (ID: ${newDestinatario.id})`);
-
-  // 🆕 GUARDAR ALIASES SI EXISTEN
-  if (userData.destinatarioAliases && userData.destinatarioAliases.length > 0) {
-    console.log(`📝 Guardando ${userData.destinatarioAliases.length} aliases...`);
-    const aliasesGuardados = await saveDestinatarioAliases(newDestinatario.id, userData.destinatarioAliases);
-    
-    if (aliasesGuardados) {
-      console.log(`✅ Aliases guardados para destinatario: ${userData.newDestinatarioName}`);
-    } else {
-      console.warn(`⚠️ Error guardando aliases, pero destinatario creado exitosamente`);
-    }
+  // Guardar aliases si hay
+  if (Array.isArray(draft.aliases) && draft.aliases.length) {
+    await saveDestinatarioAliases(newDestinatario.id, draft.aliases).catch(() => {});
   }
 
-  await safeSendMessage(jid, { 
-    text: `✅ Destinatario *${userData.newDestinatarioName}* creado exitosamente${userData.destinatarioAliases?.length ? ` con ${userData.destinatarioAliases.length} seudónimos` : ''}.` 
-  });
+  await safeSendMessage(jid, { text: `✅ Destinatario *${draft.name}* creado correctamente.` });
 
-  // Verificar si estamos en modo modificación
   const isModification = userData.isModification || userData.finalStructuredData;
-  
   if (!isModification && userData.startedFromCommand === 'destinatarios') {
-    await safeSendMessage(jid, { text: "✅ Destinatario creado." });
+    await safeSendMessage(jid, { text: "✅ Listo. Escribe \"destinatarios\" para ver la lista nuevamente." });
     clearUserState(jid);
     return;
   }
 
   if (isModification) {
-    // Actualizar destinatario en los datos existentes para modificación
-    const updatedData = {
-      ...userData.finalStructuredData,
-      nombre: userData.newDestinatarioName
-    };
-    console.log('🔧 Nuevo destinatario creado en modificación:', userData.newDestinatarioName);
+    const updatedData = { ...userData.finalStructuredData, nombre: draft.name };
     await proceedToFinalConfirmationFromModification(jid, updatedData);
   } else {
-    // Flujo normal - verificar método de pago después de crear nuevo destinatario
-    await proceedToFinalConfirmation(jid, userData.newDestinatarioName, userData.structuredData);
+    await proceedToFinalConfirmation(jid, draft.name, userData.structuredData);
   }
 };
 

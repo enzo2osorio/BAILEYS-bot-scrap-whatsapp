@@ -1,4 +1,5 @@
 const supabase = require("./supabase");
+const getCuentaContable = require("./utils/destinatarios/getCuentaContableId");
 const { getOwnerIdByNameStrict } = require("./utils/destinatarios/getOwnerIdByName");
 
 function toTimestampFromPayload({ fecha, hora, fecha_iso }) {
@@ -58,38 +59,7 @@ async function saveDataFirstFlow(params) {
     return { error: "No existe el medio de pago." };
   }
 
-  let cuentaContableId = null;
-
-  try {
-    if (cuenta_contable && typeof cuenta_contable === 'string') {
-      const ownerId = await getOwnerIdByNameStrict(cuenta_contable);
-      if (ownerId) {
-        const { data: cuentaLink, error: errCuenta } = await supabase
-          .from("metodo_pago_destinatario_duenos")
-          .select("id")
-          .eq("dueno_id", ownerId)               // <- por dueño
-          .eq("metodo_pago_id", existingMedioPago.id) // <- y método
-          .maybeSingle?.() || { data: null, error: null }; // compatibilidad si maybeSingle no existe
-
-        if (errCuenta) {
-          console.log("⚠️ Error consultando cuenta contable:", errCuenta.message || errCuenta);
-        }
-        if (cuentaLink && cuentaLink.id) {
-          cuentaContableId = cuentaLink.id;
-        } else {
-          // No encontrada: no bloquear el guardado
-          console.log(`ℹ️ Cuenta contable no encontrada para: ${medio_pago} de ${cuenta_contable} (guardando sin vínculo)`);
-        }
-      } else {
-        console.log(`ℹ️ Dueño no resuelto para cuenta_contable="${cuenta_contable}" (guardando sin vínculo)`);
-      }
-    }
-  } catch (e) {
-    console.log("⚠️ Error resolviendo cuenta contable:", e?.message || String(e));
-  }
-
-
-
+  let cuentaContableId = await getCuentaContable(cuenta_contable, existingMedioPago);
 
   // Fecha/timestamp seguro
   const ts = toTimestampFromPayload({ fecha, hora, fecha_iso });
