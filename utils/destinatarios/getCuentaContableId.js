@@ -6,6 +6,8 @@ async function getCuentaContable(cuenta_contable, existingMedioPago) {
   try {
     if (cuenta_contable && typeof cuenta_contable === 'string') {
       const ownerId = await getOwnerIdByNameStrict(cuenta_contable);
+
+      let cuentaId;
       if (ownerId) {
         const { data: cuentaLink, error: errCuenta } = await supabase
           .from("metodo_pago_destinatario_duenos")
@@ -16,9 +18,11 @@ async function getCuentaContable(cuenta_contable, existingMedioPago) {
 
         if (errCuenta) {
           console.log("⚠️ Error consultando cuenta contable:", errCuenta.message || errCuenta);
+          return null;
         }
         if (cuentaLink && cuentaLink.id) {
-          cuentaContableId = cuentaLink.id;
+          cuentaId = cuentaLink.id;
+          return cuentaId;
         } else {
           // No encontrada: no bloquear el guardado
           console.log(`ℹ️ Cuenta contable no encontrada para: ${medio_pago} de ${cuenta_contable} (guardando sin vínculo)`);

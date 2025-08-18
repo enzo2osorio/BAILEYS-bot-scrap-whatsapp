@@ -1607,16 +1607,23 @@ const msgRetryCounterCache = new NodeCache();
 
             if (messageType === "imageMessage") {
               caption = msg.message.imageMessage.caption || "";
-
-              // 🖼️ Descargar imagen primero
               imagePath = await downloadImageMessage(msg, senderName, messageId);
               console.log(`📥 Imagen descargada en: ${imagePath}`);
               
-              // 🔍 Extraer texto desde imagen
               const extractedText = await extractTextFromImage(imagePath);
 
-              // 💡 Combinar caption + texto OCR
-              captureMessage = [caption, extractedText].filter(Boolean).join("\n\n");
+              // Combinar caption + OCR
+              const captureMessage = [caption, extractedText].filter(Boolean).join("\n\n");
+
+              if (!captureMessage.trim()) {
+                await safeSendMessage(jid, { 
+                  text: "⚠️ No pude leer texto en la imagen. Si es un comprobante, reenvía una foto más legible o escribe monto, fecha, tipo (ingreso/egreso) y medio de pago en un mensaje."
+                });
+                return; // evita continuar sin datos
+              }
+
+              await processInitialMessage(jid, captureMessage, caption, msg);
+              continue;
             } else if (messageType === "documentWithCaptionMessage" || messageType === "documentMessage") {
               // 📄 Manejo de documentos (PDFs, etc.)
               const documentCaption = messageType === 'documentWithCaptionMessage' ? msg.message.documentWithCaptionMessage.caption || "" : msg.message.documentMessage || "";
@@ -3647,100 +3654,6 @@ async function downloadImageMessage(message, senderName, messageId) {
   }
 }
 
-// �📁 FUNCIÓN GENERAL PARA DESCARGAR CUALQUIER MEDIA ORGANIZADA POR USUARIO
-async function downloadMediaByUser(message, messageType, senderJid, messageId) {
-  try {
-    const buffer = await downloadMediaMessage(
-      message,
-      "buffer",
-      {},
-      {
-        logger: console,
-        reuploadRequest: sock.updateMediaMessage,
-      }
-    );
-
-    if (buffer) {
-      // Sanitizar JID para crear carpeta específica
-      const sanitizedJid = senderJid.replace(/[@.:]/g, "_");
-
-      // Crear directorio de descargas organizado por usuario
-      const downloadsDir = path.join(__dirname, "downloads");
-      const userDownloadsDir = path.join(downloadsDir, sanitizedJid);
-      await fs.promises.mkdir(userDownloadsDir, { recursive: true });
-
-      // Obtener información del archivo según el tipo
-      const timestamp =
-        message.messageTimestamp || Math.floor(Date.now() / 1000);
-      let extension = "";
-      let prefix = "";
-      let mimetype = "";
-
-      switch (messageType) {
-        case "imageMessage":
-          mimetype = message.message.imageMessage.mimetype || "image/jpeg";
-          prefix = "img";
-          if (mimetype.includes("png")) extension = ".png";
-          else if (mimetype.includes("gif")) extension = ".gif";
-          else if (mimetype.includes("webp")) extension = ".webp";
-          else extension = ".jpg";
-          break;
-
-        case "videoMessage":
-          mimetype = message.message.videoMessage.mimetype || "video/mp4";
-          prefix = "vid";
-          if (mimetype.includes("webm")) extension = ".webm";
-          else if (mimetype.includes("avi")) extension = ".avi";
-          else if (mimetype.includes("mov")) extension = ".mov";
-          else extension = ".mp4";
-          break;
-
-        case "audioMessage":
-          mimetype = message.message.audioMessage.mimetype || "audio/ogg";
-          prefix = "aud";
-          if (mimetype.includes("mp3")) extension = ".mp3";
-          else if (mimetype.includes("wav")) extension = ".wav";
-          else if (mimetype.includes("m4a")) extension = ".m4a";
-          else extension = ".ogg";
-          break;
-
-        case "documentMessage":
-          const fileName =
-            message.message.documentMessage.fileName || "document";
-          mimetype =
-            message.message.documentMessage.mimetype ||
-            "application/octet-stream";
-          prefix = "doc";
-          extension = path.extname(fileName) || ".bin";
-          break;
-
-        default:
-          prefix = "media";
-          extension = ".bin";
-      }
-
-      // Crear nombre de archivo único
-      const fileName = `${prefix}_${timestamp}_${messageId}${extension}`;
-      const filePath = path.join(userDownloadsDir, fileName);
-
-      // Guardar archivo
-      await fs.promises.writeFile(filePath, buffer);
-
-      console.log(`📁 ${messageType} guardado: ${sanitizedJid}/${fileName}`);
-
-      return filePath;
-    }
-
-    return null;
-  } catch (error) {
-    console.error(
-      `Error descargando ${messageType} ${messageId}:`,
-      error.message
-    );
-    return null;
-  }
-}
-
 
 const isConnected = () => {
   return sock?.user ? true : false;
@@ -3783,6 +3696,10 @@ try {
   console.log("💡 Verifica que las credenciales de Google Cloud están configuradas correctamente.");
 }
 
+function isSupabasePublicUrl(url) {
+  return typeof url === 'string' && /\/storage\/v1\/object\/public\//.test(url);
+}
+
 const extractTextFromImage = async (imageUrl) => {
   try {
     if (!visionClient) {
@@ -3790,53 +3707,98 @@ const extractTextFromImage = async (imageUrl) => {
       return "";
     }
 
-    // Verificar si es URL de Supabase (pública)
-    if (imageUrl.includes('supabase')) {
-      console.log(`🔍 Analizando imagen directamente desde Supabase: ${imageUrl}`);
-      
-      // Usar la URL directamente con Google Vision
-      const [result] = await visionClient.textDetection(imageUrl);
-      const detections = result.textAnnotations;
-      
-      if (detections && detections.length > 0) {
-        const fullText = detections[0].description || "";
-        console.log(`📄 Texto detectado desde URL (${fullText.length} caracteres):`, fullText.substring(0, 200) + "...");
-        return fullText;
-      } else {
-        console.log("📄 No se detectó texto en la imagen");
-        return "";
+    // Permitir forzar la descarga local si hay problemas con URLs directas
+    const forceDownload = String(process.env.VISION_FORCE_DOWNLOAD || '').toLowerCase() === 'true';
+
+    // 1) Intento con imageUri (documentTextDetection) para URL públicas
+    if (!forceDownload && isSupabasePublicUrl(imageUrl)) {
+      console.log(`🔍 Analizando (document) desde URL: ${imageUrl}`);
+      const request = {
+        image: { source: { imageUri: imageUrl } },
+        imageContext: { languageHints: ['es', 'en'] }
+      };
+
+      // a) documentTextDetection (mejor para comprobantes)
+      const [docRes] = await visionClient.documentTextDetection(request);
+      const docText = docRes?.fullTextAnnotation?.text || docRes?.textAnnotations?.[0]?.description || "";
+      if (docText.trim()) {
+        console.log(`📄 Texto (document) detectado desde URL (${docText.length} chars)`);
+        return docText;
       }
-    } else {
-      // Retrocompatibilidad para rutas locales
-      const tempFilePath = imageUrl.startsWith('../') ? `./${imageUrl.substring(3)}` : imageUrl;
-      
-      if (!fs.existsSync(tempFilePath)) {
-        console.error(`❌ Archivo de imagen no encontrado: ${tempFilePath}`);
+
+      // b) textDetection (fallback rápido)
+      console.log("↩️ Sin texto con documentTextDetection, probando textDetection desde URL...");
+      const [txtRes] = await visionClient.textDetection(request);
+      const txtText = txtRes?.textAnnotations?.[0]?.description || "";
+      if (txtText.trim()) {
+        console.log(`📄 Texto (text) detectado desde URL (${txtText.length} chars)`);
+        return txtText;
+      }
+
+      console.log("⚠️ Sin texto desde URL pública; intentando descarga local (fallback)...");
+      // Si llegó aquí, continuar al fallback local abajo
+    }
+
+    // 2) Fallback: descargar a archivo temporal y analizar localmente (mejor compatibilidad)
+    let tempFilePath = null;
+    try {
+      // Reutiliza tu downloader de Supabase
+      if (isSupabasePublicUrl(imageUrl)) {
+        // Extraer bucket/path de la URL pública
+        const parts = imageUrl.split('/');
+        const bucket = parts[parts.indexOf('public') + 1]; // 'whatsapp-images-2'
+        const afterBucket = parts.slice(parts.indexOf(bucket) + 1).join('/');
+        tempFilePath = await downloadFileFromSupabase(bucket, afterBucket);
+      } else {
+        tempFilePath = imageUrl; // rutas locales
+      }
+
+      if (!tempFilePath || !fs.existsSync(tempFilePath)) {
+        console.error("❌ No se pudo preparar imagen local para OCR");
         return "";
       }
 
-      console.log(`🔍 Analizando imagen local: ${tempFilePath}`);
-      const [result] = await visionClient.textDetection(tempFilePath);
-      const detections = result.textAnnotations;
-      
-      if (detections && detections.length > 0) {
-        const fullText = detections[0].description || "";
-        console.log(`📄 Texto detectado (${fullText.length} caracteres):`, fullText.substring(0, 200) + "...");
-        return fullText;
-      } else {
-        console.log("📄 No se detectó texto en la imagen");
-        return "";
+      console.log(`🔬 Analizando local (document): ${tempFilePath}`);
+      const [docLocal] = await visionClient.documentTextDetection({
+        image: { content: await fs.promises.readFile(tempFilePath) },
+        imageContext: { languageHints: ['es', 'en'] }
+      });
+      const localDocText = docLocal?.fullTextAnnotation?.text || docLocal?.textAnnotations?.[0]?.description || "";
+      if (localDocText.trim()) {
+        console.log(`📄 Texto (document local) detectado (${localDocText.length} chars)`);
+        return localDocText;
+      }
+
+      console.log("↩️ Sin texto con document local, probando text local...");
+      const [txtLocal] = await visionClient.textDetection({
+        image: { content: await fs.promises.readFile(tempFilePath) },
+        imageContext: { languageHints: ['es', 'en'] }
+      });
+      const localTxtText = txtLocal?.textAnnotations?.[0]?.description || "";
+      if (localTxtText.trim()) {
+        console.log(`📄 Texto (text local) detectado (${localTxtText.length} chars)`);
+        return localTxtText;
+      }
+
+      console.log("📄 No se detectó texto en la imagen (tras URL y local)");
+      return "";
+    } finally {
+      // Limpieza del archivo temporal si lo descargamos
+      try {
+        if (tempFilePath && tempFilePath.startsWith(require('os').tmpdir())) {
+          await cleanupTempFile(tempFilePath);
+        }
+      } catch(e){
+        console.log("Error al limpiar archivo temporal:", e.message);
       }
     }
   } catch (err) {
     console.error("❌ Error en Vision OCR:", err.message);
     
-    // Si falla con URL, podrías implementar fallback a descarga temporal
     if (imageUrl.includes('supabase')) {
-      console.log("⚠️ Falló análisis directo de URL, intentando descarga temporal...");
+      console.log("⚠️ Falló análisis directo de URL, intentando descarga temporal (fallback)...");
       return await extractTextFromImageFallback(imageUrl);
     }
-    
     return "";
   }
 };

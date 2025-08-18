@@ -18,7 +18,7 @@ async function saveNewSubcategory(name, categoryId) {
   try {
     const { data, error } = await supabase
       .from('subcategorias')
-      .insert([{ name, category_id: categoryId }])
+      .insert([{ name, categoria_id: categoryId }])
       .select()
       .single();
     if (error) return null;
