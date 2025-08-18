@@ -11,7 +11,7 @@ async function cuentaLinkExists(ownerName, metodoPagoName) {
     }
     const { data, error } = await supabase
       .from('metodo_pago_destinatario_duenos')
-      .select('id,descripcion')
+      .select('id,description')
       .eq('destinatario_id', ownerId)
       .eq('metodo_pago_id', metodoId)
       .maybeSingle();
@@ -21,7 +21,7 @@ async function cuentaLinkExists(ownerName, metodoPagoName) {
       return (metodoPagoName && ownerName) ? `${metodoPagoName} de ${ownerName}` : null;
     }
 
-    return data?.descripcion || ((metodoPagoName && ownerName) ? `${metodoPagoName} de ${ownerName}` : null);
+    return data?.description || ((metodoPagoName && ownerName) ? `${metodoPagoName} de ${ownerName}` : null);
   } catch (e) {
     console.log('⚠️ Excepción resolviendo cuenta contable:', e?.message || String(e));
     return (metodoPagoName && ownerName) ? `${metodoPagoName} de ${ownerName}` : null;
@@ -29,12 +29,12 @@ async function cuentaLinkExists(ownerName, metodoPagoName) {
 }
 
 
-async function createCuentaContableLink(ownerId, metodoId, descripcion) {
+async function createCuentaContableLink(ownerId, metodoId, description) {
   try {
     const payload = {
       destinatario_id: ownerId,
       metodo_pago_id: metodoId,
-      descripcion: descripcion,
+      description: description,
       created_at: new Date().toISOString(),
     };
     const { data, error } = await supabase
