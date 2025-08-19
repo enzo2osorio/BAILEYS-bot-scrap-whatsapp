@@ -333,7 +333,7 @@ async function showCuentaLinksForModification(jid, userData) {
 }
 
 async function showOwnersDueñosForCuentaLink(jid, context = {}) {
-  const owners = await getOwnersDuenos();
+  const owners = await getOwnersDueños();
   if (!owners.length) {
     await safeSendMessage(jid, { text: "❌ No hay dueños registrados. Crea un destinatario con categoría 'administradores' y subcategoría 'dueños del negocio'." });
     clearUserState(jid);
@@ -392,6 +392,40 @@ async function handleCuentaLinkModificationSelection(jid, textMessage, userState
   const withCuenta = await ensureCuentaFields(updated);
   await safeSendMessage(jid, { text: `✅ Cuenta contable actualizada a: ${selected.label}` });
   await proceedToFinalConfirmationFromModification(jid, withCuenta);
+}
+
+// Mostrar métodos de pago para crear vínculo de cuenta (con opción de crear nuevo)
+async function showMetodosPagoForCuentaLink(jid, structuredData) {
+  try {
+    const metodosPago = await getMetodosPago();
+
+    if (metodosPago.length === 0) {
+      await safeSendMessage(jid, { text: "❌ No hay métodos de pago registrados. Crea uno nuevo." });
+    }
+
+    let metodosList = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
+    metodosPago.forEach((metodo, index) => {
+      metodosList += `${index + 2}. ${metodo.name}\n`;
+    });
+
+    setUserState(jid, STATES.AWAITING_CREATE_CUENTA_METODO_PAGO_SELECTION, {
+      structuredData,
+      availableMetodosPago: metodosPago,
+      accountLinkFlow: true,
+      startedFromCommand: structuredData.startedFromCommand || null
+    });
+
+    await safeSendMessage(jid, {
+      text:
+        `💳 Elige el método de pago para la cuenta de ${structuredData.cuenta_contable}:\n\n` +
+        metodosList +
+        `\nEscribe el número:`
+    });
+  } catch (error) {
+    console.error("Error en showMetodosPagoForCuentaLink:", error);
+    await safeSendMessage(jid, { text: "❌ Error mostrando métodos de pago." });
+    clearUserState(jid);
+  }
 }
 
 async function handleCreateCuentaOwnerSelectionDynamic(jid, textMessage, userState) {
@@ -530,7 +564,7 @@ const io = require("socket.io")(server);
 const port = process.env.PORT || 8000;
 const qrcode = require("qrcode");
 const { saveNewCategory, saveNewSubcategory } = require("./utils/saveNewCategory&Subcategory.js");
-const { listCuentaLinksWithNames, getOwnersDuenos } = require("./utils/getOwnersDuenos.js");
+const { listCuentaLinksWithNames, getOwnersDueños } = require("./utils/getOwnersDuenos.js");
 
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
@@ -2193,39 +2227,6 @@ async function handleCreateCuentaOwnerSelection(jid, textMessage, userState) {
   await showMetodosPagoForCuentaLink(jid, updated);
 }
 
-// Mostrar métodos de pago para crear vínculo de cuenta (con opción de crear nuevo)
-async function showMetodosPagoForCuentaLink(jid, structuredData) {
-  try {
-    const metodosPago = await getMetodosPago();
-
-    if (metodosPago.length === 0) {
-      await safeSendMessage(jid, { text: "❌ No hay métodos de pago registrados. Crea uno nuevo." });
-    }
-
-    let metodosList = "0. ❌ Cancelar\n1. ➕ Crear nuevo método de pago\n";
-    metodosPago.forEach((metodo, index) => {
-      metodosList += `${index + 2}. ${metodo.name}\n`;
-    });
-
-    setUserState(jid, STATES.AWAITING_CREATE_CUENTA_METODO_PAGO_SELECTION, {
-      structuredData,
-      availableMetodosPago: metodosPago,
-      accountLinkFlow: true,
-      startedFromCommand: structuredData.startedFromCommand || null
-    });
-
-    await safeSendMessage(jid, {
-      text:
-        `💳 Elige el método de pago para la cuenta de ${structuredData.cuenta_contable}:\n\n` +
-        metodosList +
-        `\nEscribe el número:`
-    });
-  } catch (error) {
-    console.error("Error en showMetodosPagoForCuentaLink:", error);
-    await safeSendMessage(jid, { text: "❌ Error mostrando métodos de pago." });
-    clearUserState(jid);
-  }
-}
 
 // Handler: selección de método de pago para crear la cuenta
 async function handleCuentaLinkMetodoPagoSelection(jid, textMessage, userState) {
@@ -3398,7 +3399,7 @@ const saveComprobante = async (jid, userData) => {
 }
 
   // 📝 Mostrar menú de modificación
-  const showModificationMenu = async (jid, userData) => {
+const showModificationMenu = async (jid, userData) => {
   setUserState(jid, STATES.AWAITING_MODIFICATION_SELECTION, userData);
   await safeSendMessage(jid, {
     text:
@@ -3455,8 +3456,11 @@ const saveComprobante = async (jid, userData) => {
       await showMediosPagoForModification(jid, userState.data);
       break;
     case 6:
+       // NUEVO: mostrar combinaciones reales (método + dueño)
       await showCuentaLinksForModification(jid, userState.data);
       break;
+    default:
+      await safeSendMessage(jid, { text: "⚠️ Opción no válida." });
   }
 };
 

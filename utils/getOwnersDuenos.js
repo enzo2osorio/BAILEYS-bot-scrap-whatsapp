@@ -40,17 +40,16 @@ async function getMetodoPagoNameByID(id) {
 
 async function listCuentaLinksWithNames() {
   try {
-    // 1) Traer vínculos
+    // 1) Traer vínculos (usar "description")
     const { data: links, error: errLinks } = await supabase
       .from('metodo_pago_destinatario_duenos')
-      .select('id, metodo_pago_id, destinatario_id, descripcion')
-      .order('descripcion', { ascending: true });
+      .select('id, metodo_pago_id, destinatario_id, description')
+      .order('description', { ascending: true });
     if (errLinks) {
       console.error('Error obteniendo vínculos de cuentas:', errLinks);
       return [];
     }
     const allLinks = links || [];
-
     if (allLinks.length === 0) return [];
 
     // 2) Traer todos los métodos de pago
@@ -66,14 +65,14 @@ async function listCuentaLinksWithNames() {
     for (const l of allLinks) {
       const metodoName = mpMap.get(l.metodo_pago_id) || await getMetodoPagoNameByID(l.metodo_pago_id) || 'Método desconocido';
       const ownerName = ownerMap.get(l.destinatario_id) || '(dueño no listado)';
-      const label = l.descripcion || `${metodoName} de ${ownerName}`;
+      const label = l.description || `${metodoName} de ${ownerName}`;
       result.push({
         id: l.id,
         metodo_pago_id: l.metodo_pago_id,
         owner_id: l.destinatario_id,
         metodo_name: metodoName,
         owner_name: ownerName,
-        descripcion: l.descripcion || null,
+        description: l.description || null,
         label
       });
     }
@@ -85,7 +84,6 @@ async function listCuentaLinksWithNames() {
 }
 
 module.exports = {
-  getOwnersDuenos: getOwnersDueños,
   getOwnersDueños,
   getMetodoPagoNameByID,
   listCuentaLinksWithNames

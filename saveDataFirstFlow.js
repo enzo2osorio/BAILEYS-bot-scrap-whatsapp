@@ -2,6 +2,16 @@ const supabase = require("./supabase");
 const getCuentaContable = require("./utils/destinatarios/getCuentaContableId");
 const { getOwnerIdByNameStrict } = require("./utils/destinatarios/getOwnerIdByName");
 
+// Normaliza nombres conocidos (acentos y caja)
+function canonicalizeOwnerName(name) {
+  if (!name) return null;
+  const n = String(name).trim().toLowerCase();
+  if (n === 'erica romina davila' || n === 'erica romina dávila' || n === 'erica davila' || n === 'erica') return 'Erica Romina Dávila';
+  if (n === 'nicolas olave' || n === 'nicolás olave' || n === 'nicolás' || n === 'nicolas') return 'Nicolás Olave';
+  if (n === 'caja general' || n === 'caja' || n === 'efectivo') return 'Caja General';
+  return name;
+}
+
 function toTimestampFromPayload({ fecha, hora, fecha_iso }) {
   if (typeof fecha_iso === 'string' && !Number.isNaN(Date.parse(fecha_iso))) {
     return new Date(fecha_iso);
@@ -60,26 +70,48 @@ async function saveDataFirstFlow(params) {
   }
 
   //hallando el owner ID
+  let ownerId = null;
+  const ownerNameCanonical = canonicalizeOwnerName(cuenta_contable);
 
-  const {data: ownerData, error: ownerError} = await supabase
-  .from("destinatarios")
-  .select("id")
-  .eq("name", cuenta_contable)
-  .single();
+  try {
+    if (ownerNameCanonical) {
+      // 1) Intento estricto (tu helper)
+      ownerId = await getOwnerIdByNameStrict(ownerNameCanonical);
 
-  if (ownerError || !ownerData) {
-    console.log("⚠️ Error obteniendo ownerId:", ownerError?.message || ownerError);
-    return null;
+      // 2) Fallback: tomar la primera coincidencia exacta por name (sin .single())
+      if (!ownerId) {
+        const { data: rows, error: ownerError } = await supabase
+          .from("destinatarios")
+          .select("id")
+          .eq("name", ownerNameCanonical)
+          .limit(1);
+
+        if (ownerError) {
+          console.log("⚠️ Error consultando destinatarios (owner fallback):", ownerError.message || ownerError);
+        } else if (Array.isArray(rows) && rows.length > 0) {
+          ownerId = rows[0].id;
+        } else {
+          console.log(`ℹ️ No se encontró owner "${ownerNameCanonical}" (guardando sin vínculo de cuenta contable).`);
+        }
+      }
+    }
+   } catch (e) {
+    console.log("⚠️ Error resolviendo ownerId:", e?.message || String(e));
   }
 
-  const ownerId = ownerData.id;
-
-  //hallando la cuenta contable
-  const cuentaContableId = await getCuentaContable(ownerId, existingMedioPago);
-  if (!cuentaContableId) {
-    return { error: "No se pudo encontrar la cuenta contable." };
+   // Resolver cuenta contable (opcional)
+  let cuentaContableId = null;
+  try {
+    if (ownerId) {
+      // Si tu helper acepta el objeto de método, mantenlo; si espera ID, pásale existingMedioPago.id
+      cuentaContableId = await getCuentaContable(ownerId, existingMedioPago);
+      if (!cuentaContableId) {
+        console.log(`ℹ️ No se encontró vínculo de cuenta para ${medio_pago} de ${ownerNameCanonical} (guardando sin cuenta_contable_id).`);
+      }
+    }
+  } catch (e) {
+    console.log("⚠️ Error obteniendo cuenta contable:", e?.message || String(e));
   }
-
 
 
   // Fecha/timestamp seguro
