@@ -3391,8 +3391,8 @@ const saveComprobante = async (jid, userData) => {
     }
     await safeSendMessage(jid, { text: userErrMsg });
     await showModificationMenu(jid, { finalStructuredData: normalized });
-  } catch (error) {
-    console.error("❌ Error guardando comprobante (excepción):", error);
+  } catch (errorrr) {
+    console.error("❌ Error guardando comprobante (excepción):", errorrr);
     await safeSendMessage(jid, { text: "❌ Error interno al guardar el comprobante. Intenta más tarde." });
     clearUserState(jid);
   }
