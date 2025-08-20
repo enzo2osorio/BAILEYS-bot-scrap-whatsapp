@@ -1799,8 +1799,20 @@ const msgRetryCounterCache = new NodeCache();
               continue;
             } else if (messageType === "documentWithCaptionMessage" || messageType === "documentMessage") {
               // 📄 Manejo de documentos (PDFs, etc.)
-              const documentCaption = messageType === 'documentWithCaptionMessage' ? msg.message.documentWithCaptionMessage.caption || "" : msg.message.documentMessage || "";
-              const fileName = msg.message.documentWithCaptionMessage.message?.documentMessage?.fileName || "";
+               let documentCaption = "";
+              let fileName = "";
+
+              if (messageType === "documentWithCaptionMessage") {
+                const docWithCap = msg.message.documentWithCaptionMessage;
+                documentCaption = docWithCap?.caption || "";
+                const docMsg = docWithCap?.message?.documentMessage;
+                fileName = docMsg?.fileName || "";
+              } else {
+                const docMsg = msg.message.documentMessage;
+                // Algunos clientes incluyen caption directamente aquí
+                documentCaption = docMsg?.caption || "";
+                fileName = docMsg?.fileName || "";
+              }
               console.log(`📄 Documento recibido: ${fileName}`);
               
               // 📥 Descargar documento
