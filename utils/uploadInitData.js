@@ -4,8 +4,7 @@ const similarDestinatarios2 = require('../sd2');
 async function uploadCategoryDataMassive(entries) {
     try {
 
-        if(!entries){
-            console.log("no existen categorias");
+        if(!entries){ 
             throw new Error("No categories provided");
         }
 

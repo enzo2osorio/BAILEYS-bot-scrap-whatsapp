@@ -2,8 +2,6 @@ const supabase = require("../supabase");
 
 const getSubcategorias = async (categoriaId) => {
   try {
-    console.log(`🔍 Intentando obtener subcategorías para categoría ID: ${categoriaId}`);
-    
     const { data, error } = await supabase
       .from('subcategorias')
       .select('id, name')

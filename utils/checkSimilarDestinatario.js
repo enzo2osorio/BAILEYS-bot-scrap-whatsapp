@@ -4,8 +4,6 @@ const supabase = require('../supabase');
 // 🔍 Verificar si existe un destinatario similar con fuzzy matching
 const checkSimilarDestinatario = async (nombreNuevo) => {
   try {
-    console.log(`🔍 Verificando destinatarios similares a: "${nombreNuevo}"`);
-    
     // Obtener todos los destinatarios de la base de datos
     const { data: allDestinatarios, error } = await supabase
       .from('destinatarios')
@@ -37,7 +35,6 @@ const checkSimilarDestinatario = async (nombreNuevo) => {
     
     // 🎯 NUEVA LÓGICA: Coincidencia exacta (score 100)
     if (bestScore === 100) {
-      console.log(`🎯 Coincidencia EXACTA encontrada: "${bestMatch.name}" (score: ${bestScore})`);
       return {
         destinatario: bestMatch,
         score: bestScore,
@@ -47,7 +44,6 @@ const checkSimilarDestinatario = async (nombreNuevo) => {
     
     // Coincidencia similar (score 94-99)
     if (bestScore >= 94) {
-      console.log(`✅ Destinatario similar encontrado: "${bestMatch.name}" (score: ${bestScore})`);
       return {
         destinatario: bestMatch,
         score: bestScore,

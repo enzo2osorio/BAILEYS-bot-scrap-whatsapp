@@ -636,18 +636,6 @@ app.get("/clear-session/:accessKey", async (req, res) => {
     qrDinamic = null;
     sock = null;
 
-    // 3. Limpiar carpeta de sesión de WhatsApp
-    const sessionPath = path.join(__dirname, "session_auth_info");
-    let sessionFolderRemoved = false;
-    
-    if (fs.existsSync(sessionPath)) {
-      console.log("🗑️ Eliminando carpeta de sesión de WhatsApp...");
-      fs.rmSync(sessionPath, { recursive: true, force: true });
-      sessionFolderRemoved = true;
-      console.log("✅ Carpeta de sesión eliminada");
-    } else {
-      console.log("ℹ️ Carpeta de sesión no existe");
-    }
 
     // 4. Limpiar store de Baileys si existe
     const storePath = path.join(__dirname, "baileys_store.json");
@@ -671,7 +659,6 @@ app.get("/clear-session/:accessKey", async (req, res) => {
       timestamp: new Date().toISOString(),
       cleaned: {
         socketClosed: socketWasClosed,
-        sessionFolderRemoved: sessionFolderRemoved,
         baileysStoreRemoved: baileysStoreRemoved
       },
       next_steps: [
@@ -920,7 +907,6 @@ const setUserState = (jid, state, data = {}) => {
     timestamp: Date.now(),
     timeout
   });
-  console.log(`🔄 Estado de ${jid} => ${state}`);
 };
 
 const getUserState = (jid) => {
@@ -1331,10 +1317,9 @@ const handleSessionError = async (error) => {
     
     // No cerrar la sesión inmediatamente por errores MAC
     // Solo registrar y continuar
-    return false; // No requiere reconexión
+    return false;
   }
-  
-  return true; // Otros errores pueden requerir reconexión
+  return true; 
 };
 
 const isSocketReady = () => {
@@ -1375,6 +1360,7 @@ const P = require("pino")({
   level: "silent",
 });
 
+//PARTE
 const graceful = async (signal) => {
   console.log(`\n${signal} recibido. Cerrando conexiones Mongo...`);
   await closeClient().catch(()=>{});
@@ -1452,7 +1438,7 @@ async function routeMetodoPagoByScore(jid, structuredData, proceedFn, showListFn
     return true;
   } catch (e) {
     console.log("❌ Error en routeMetodoPagoByScore:", e.message);
-    // Fallback: mostrar lista para no bloquear el flujo
+    
     try {
       await safeSendMessage(jid, { text: "⚠️ Ocurrió un problema detectando el método. Selecciona uno de la lista:" });
       await showListFn(jid, structuredData);
@@ -1578,10 +1564,8 @@ const msgRetryCounterCache = new NodeCache();
         const jid = msg?.key?.remoteJid;
         const messageId = msg?.key?.id;
         if (!jid || !messageId) {
-          console.log("⚠️ Mensaje sin jid/id, ignorando");
           return;
         }
-        console.log(`🔍 Mensaje recibido de: ${jid}`);
         const senderName = contactStore[jid]?.name || jid.split("@")[0];
         const messageType = getContentType(msg.message);
         
@@ -1590,17 +1574,12 @@ const msgRetryCounterCache = new NodeCache();
         if (messageType === "protocolMessage" || 
             messageType === "reactionMessage" || 
             messageType === "senderKeyDistributionMessage") {
-          console.log(`⏭️ Ignorando mensaje de tipo: ${messageType}`);
           continue;
         }
-          
-          console.log({messageType})
         if (isAllowedJid(jid)) {
 
         // 🔄 Verificar estado actual del usuario
           const userState = getUserState(jid);
-          console.log(`🔍 Estado actual de ${senderName}: ${userState.state}`);
-
           touchUserActivity(jid);
 
           // 📝 MANEJO DE MENSAJES DE TEXTO SEGÚN ESTADO
@@ -2376,9 +2355,8 @@ Analizar todo el texto recibido y construir un objeto JSON con los siguientes ca
 - IMPORTANTE: Si en alguna parte del texto se menciona "Efectivo" o sus abreviaciones coloquiales (ef, efec, etc...) La cuenta contable será "Caja General", y por relación, trataremos a la cuenta como "Efectivo desde Caja General", pues el efectivo no se trata por separado, sino que se globaliza como "Caja General".
 - La propiedad **cuenta_contable** se usará para llevar la gestión de movimientos de las cuentas de estas personas, de manera más granular indicando movimientos ya no solo "egresos" o "ingresos", sino ahora podremos señalar (ejemplos) "egreso desde la cuenta de Nicolás Olave", o "ingresos a la cuenta de Erica Romina".
 - Los nombres que podrá entrar en esta propiedad serán estrictamente uno de tres: "Erica Romina Dávila", "Nicolás Olave" o "Caja General" (en la mayoría de casos se usará los dos primeros).
-
 - **"tipo_movimiento"** puede ser solo: "ingreso" o "egreso".
-  
+- Si se detecta una mención a "seña hospedaje", "resto hospedaje", "final hospedaje", o variaciones similares como diminutivos, siempre asociando a que se trata de un pago de hospedaje, se relacionara el tipo de movimiento como "ingreso", así no se especifique este.
 - La **fecha** debe estar en formato "dd/mm/yyyy" y la hora en "hh:mm" (24 horas).
   
 - El **proveedor** es generalmente quien **recibe el dinero** cuando se trata de un **egreso**, y es muy importante identificarlo.
@@ -2449,14 +2427,12 @@ Responde únicamente con el JSON, sin texto adicional.
             try { destMatchInfo = await matchDestinatario(resolvedName); } catch (e) { console.log("⚠️ Error matchDestinatario:", e?.message); }
 
             if (!destMatchInfo?.clave || destMatchInfo.scoreClave < DEST_SCORE_MIN_LIST) {
-              console.log(`⚠️ Score destinatario bajo (${destMatchInfo?.scoreClave || 0}) → lista`);
               await safeSendMessage(jid, { text: "👤 El destinatario detectado no es claro. Selecciona uno o crea uno nuevo:" });
               await showAllDestinatariosList(jid, baseDataWithCuenta);
               return;
             }
 
             if (destMatchInfo.scoreClave < DEST_SCORE_MIN_AUTO) {
-              console.log(`🔍 Destinatario necesita confirmación: ${destMatchInfo.clave} (score ${destMatchInfo.scoreClave})`);
               setUserState(jid, STATES.AWAITING_DESTINATARIO_FUZZY_CONFIRMATION, {
                 structuredData: baseDataWithCuenta,
                 originalData: baseDataWithCuenta,
@@ -2560,9 +2536,6 @@ async function handleMedioPagoSelection(jid, textMessage, userState, quotedMsg) 
   const option = parseInt(textMessage.trim(), 10);
   const allMetodosPago = userState?.data?.allMetodosPago || [];
   const maxOption = allMetodosPago.length + 1;
-
-  console.log(`🔍 AWAITING_MEDIO_PAGO_SELECTION -> opción: ${option}, max: ${maxOption}`);
-
   if (isNaN(option) || option < 0 || option > maxOption) {
     await safeSendMessage(jid, { text: `⚠️ Por favor, escribe un número válido (0 a ${maxOption}).` });
     return;
@@ -2588,8 +2561,6 @@ async function handleMedioPagoSelection(jid, textMessage, userState, quotedMsg) 
     await safeSendMessage(jid, { text: "⚠️ Opción no válida. Intenta nuevamente." });
     return;
   }
-
-  console.log(`✅ Método de pago seleccionado: ${selected.name}`);
   await proceedToFinalConfirmationWithMetodoPago(jid, selected.name, userState.data.structuredData);
 }
 
@@ -2673,9 +2644,7 @@ const handleNewMetodoPagoName = async (jid, textMessage, userState, quotedMsg) =
 
 // 💾 Guardar nuevo método de pago en Supabase
 const saveNewMetodoPago = async (name) => {
-  try {
-    console.log(`💾 Guardando nuevo método de pago: ${name}`);
-    
+  try {   
     const { data, error } = await supabase
       .from('metodos_pago')
       .insert([{ name: name }])
@@ -2686,8 +2655,6 @@ const saveNewMetodoPago = async (name) => {
       console.error("❌ Error guardando método de pago:", error);
       return null;
     }
-    
-    console.log("✅ Método de pago guardado:", data);
     return data;
   } catch (error) {
     console.error('❌ Error en saveNewMetodoPago:', error.message);
@@ -2795,14 +2762,12 @@ async function handleNewSubcategoryCategorySelection(jid, textMessage, userState
 const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, structuredData) => {
   // Evitar duplicado
   if (getUserState(jid).state === STATES.AWAITING_SAVE_CONFIRMATION) {
-    console.log("ℹ️ Ignorando confirmación duplicada (ya en AWAITING_SAVE_CONFIRMATION)");
     return;
   }
 
   // Validar existencia de medio de pago solo para decidir si mostrar lista ahora
   const valido = await isKnownMedioPago(metodoPagoName);
   if (!valido) {
-    console.log(`⚠️ Método de pago no válido: "${metodoPagoName}". Pidiendo selección manual.`);
     await safeSendMessage(jid, { text: `💳 No se reconoció el método de pago "${metodoPagoName}". Selecciona uno existente o crea uno nuevo:` });
     await showAllMetodosPagoList(jid, { ...structuredData, medio_pago: metodoPagoName });
     return;
@@ -3020,9 +2985,6 @@ const handleNewDestinatarioName = async (jid, textMessage, userState, quotedMsg)
   // Actualiza draft con el nombre
   const draft = { ...(userState.data.creationDraft || {}) , name: nombreCanonico };
   const newStateData = { ...userState.data, creationDraft: draft };
-
-  console.log(`🔍 Procesando nuevo destinatario: "${nombreCanonico}"`);
-
   // Coincidencias
   const similarMatch = await checkSimilarDestinatario(nombreCanonico);
   if (similarMatch?.isExactMatch) {
@@ -3098,9 +3060,7 @@ const handleDestinatarioFuzzyConfirmation = async (jid, textMessage, userState, 
 
   switch (option) {
     case 1: // Usar destinatario existente
-      const destinatarioExistente = userState.data.destinatarioSimilar;
-      console.log(`✅ Usuario eligió destinatario existente: ${destinatarioExistente.name}`);
-      
+      const destinatarioExistente = userState.data.destinatarioSimilar;      
       // Verificar si estamos en modo modificación
       const isModification = userState.data.isModification || userState.data.finalStructuredData;
       
@@ -3110,7 +3070,6 @@ const handleDestinatarioFuzzyConfirmation = async (jid, textMessage, userState, 
           ...userState.data.finalStructuredData,
           nombre: destinatarioExistente.name
         };
-        console.log('🔧 Destinatario existente seleccionado en modificación:', destinatarioExistente.name);
         await safeSendMessage(jid, { text: `✅ Destinatario actualizado a: ${destinatarioExistente.name}` });
         await proceedToFinalConfirmationFromModification(jid, updatedData);
       } else {
@@ -3121,7 +3080,6 @@ const handleDestinatarioFuzzyConfirmation = async (jid, textMessage, userState, 
       
     case 2: // Crear nuevo destinatario
       const nombreNuevo = userState.data.nombreCanonicoNuevo;
-      console.log(`✅ Usuario eligió crear nuevo destinatario: ${nombreNuevo}`);
       await proceedToAliasesInput(jid, nombreNuevo, userState.data);
       break;
       
@@ -3352,10 +3310,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     const dataWithDestinatario = {
       ...structuredData,
       nombre: destinatarioName
-    };
-
-    console.log(`🔍 Verificando método de pago: "${dataWithDestinatario.medio_pago}"`);
-    
+    };    
     // Buscar coincidencia de método de pago
     const proceed = await routeMetodoPagoByScore(jid, dataWithDestinatario, proceedToFinalConfirmationWithMetodoPago, showAllMetodosPagoList);
     if (!proceed) return;
@@ -3656,21 +3611,19 @@ const showModificationMenu = async (jid, userData) => {
   await proceedToFinalConfirmationFromModification(jid, updatedData);
 };
 
- // 4) Arreglar proceedToFinalConfirmationFromModification (sin validar aquí)
-const proceedToFinalConfirmationFromModification = async (jid, finalData) => {
-  console.log('🔧 Datos recibidos en proceedToFinalConfirmationFromModification:', finalData);
-
-  const ensured = await ensureCuentaFields(finalData);
-  const normalized = normalizeDateTime(ensured);
-
-  await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
-  setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
-    finalStructuredData: normalized
-  });
-
-  await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized, true)}` });
-};
 }
+// 4) Arreglar proceedToFinalConfirmationFromModification (sin validar aquí)
+const proceedToFinalConfirmationFromModification = async (jid, finalData) => {
+ const ensured = await ensureCuentaFields(finalData);
+ const normalized = normalizeDateTime(ensured);
+
+ await saveTempSession(jid, normalized, 'AWAITING_SAVE_CONFIRMATION');
+ setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
+   finalStructuredData: normalized
+ });
+
+ await safeSendMessage(jid, { text: `${formatFinalConfirmation(normalized, true)}` });
+};
 
 async function downloadDocumentMessage(message, senderName, messageId) {
   try {
@@ -3725,10 +3678,6 @@ async function downloadDocumentMessage(message, senderName, messageId) {
 
       // Guardar archivo
       await fs.promises.writeFile(filePath, buffer);
-
-      console.log(`📄 Documento guardado: ${sanitizedJid}/${finalFileName}`);
-      console.log(`📝 Tipo: ${mimetype}, Tamaño: ${buffer.length} bytes`);
-
       return filePath; // Retornar ruta absoluta
     }
 
@@ -3779,7 +3728,6 @@ async function downloadImageMessage(message, senderName, messageId) {
       );
 
       if (uploadResult.success) {
-        console.log(`📸 Imagen subida a Supabase: ${uploadResult.url}`);
         return uploadResult.url; // Retornar URL de Supabase
       } else {
         console.error(`❌ Error subiendo imagen: ${uploadResult.error}`);
@@ -3803,9 +3751,7 @@ const isConnected = () => {
 let visionClient = null;
 try {
   // 🌐 Manejo para Render: Crear archivo temporal desde JSON en variable de entorno
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
-    console.log("🔧 Configurando credenciales de Google desde variable de entorno JSON...");
-    
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {    
     // Crear archivo temporal con las credenciales
     const tempCredPath = path.join(__dirname, 'gcloud-creds.json');
     fs.writeFileSync(tempCredPath, process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
@@ -3813,21 +3759,17 @@ try {
     // Setear la ruta del archivo temporal para que Google Vision lo use
     process.env.GOOGLE_APPLICATION_CREDENTIALS = tempCredPath;
     
-    visionClient = new vision.ImageAnnotatorClient();
-    console.log("✅ Google Vision cliente inicializado desde variable de entorno JSON (Render).");
-    
+    visionClient = new vision.ImageAnnotatorClient();    
   } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
     // 📁 Manejo tradicional: archivo de credenciales local
     const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
     if (!fs.existsSync(credentialsPath)) {
       console.error(`❌ Archivo de credenciales no encontrado en: ${credentialsPath}`);
-      console.log("⚠️ GOOGLE_APPLICATION_CREDENTIALS configurada, pero el archivo no existe.");
     } else {
       visionClient = new vision.ImageAnnotatorClient();
       console.log("✅ Google Vision cliente inicializado con credenciales de archivo local.");
     }
   } else {
-    console.log("⚠️ Credenciales de Google no configuradas - OCR deshabilitado.");
     console.log("💡 Para Render: Configura GOOGLE_APPLICATION_CREDENTIALS_JSON con el contenido del JSON");
     console.log("💡 Para local: Configura GOOGLE_APPLICATION_CREDENTIALS con la ruta al archivo JSON");
   }
@@ -3852,7 +3794,6 @@ const extractTextFromImage = async (imageUrl) => {
 
     // 1) Intento con imageUri (documentTextDetection) para URL públicas
     if (!forceDownload && isSupabasePublicUrl(imageUrl)) {
-      console.log(`🔍 Analizando (document) desde URL: ${imageUrl}`);
       const request = {
         image: { source: { imageUri: imageUrl } },
         imageContext: { languageHints: ['es', 'en'] }
@@ -3862,7 +3803,6 @@ const extractTextFromImage = async (imageUrl) => {
       const [docRes] = await visionClient.documentTextDetection(request);
       const docText = docRes?.fullTextAnnotation?.text || docRes?.textAnnotations?.[0]?.description || "";
       if (docText.trim()) {
-        console.log(`📄 Texto (document) detectado desde URL (${docText.length} chars)`);
         return docText;
       }
 
@@ -3871,11 +3811,8 @@ const extractTextFromImage = async (imageUrl) => {
       const [txtRes] = await visionClient.textDetection(request);
       const txtText = txtRes?.textAnnotations?.[0]?.description || "";
       if (txtText.trim()) {
-        console.log(`📄 Texto (text) detectado desde URL (${txtText.length} chars)`);
         return txtText;
       }
-
-      console.log("⚠️ Sin texto desde URL pública; intentando descarga local (fallback)...");
       // Si llegó aquí, continuar al fallback local abajo
     }
 
@@ -3897,15 +3834,12 @@ const extractTextFromImage = async (imageUrl) => {
         console.error("❌ No se pudo preparar imagen local para OCR");
         return "";
       }
-
-      console.log(`🔬 Analizando local (document): ${tempFilePath}`);
       const [docLocal] = await visionClient.documentTextDetection({
         image: { content: await fs.promises.readFile(tempFilePath) },
         imageContext: { languageHints: ['es', 'en'] }
       });
       const localDocText = docLocal?.fullTextAnnotation?.text || docLocal?.textAnnotations?.[0]?.description || "";
       if (localDocText.trim()) {
-        console.log(`📄 Texto (document local) detectado (${localDocText.length} chars)`);
         return localDocText;
       }
 
@@ -3916,7 +3850,6 @@ const extractTextFromImage = async (imageUrl) => {
       });
       const localTxtText = txtLocal?.textAnnotations?.[0]?.description || "";
       if (localTxtText.trim()) {
-        console.log(`📄 Texto (text local) detectado (${localTxtText.length} chars)`);
         return localTxtText;
       }
 
@@ -3947,8 +3880,6 @@ const extractTextFromImageFallback = async (imageUrl) => {
   let tempFilePath = null;
   
   try {
-    console.log("🔄 Usando método de fallback para análisis de imagen");
-    
     // Extraer bucket y path de la URL
     const urlParts = imageUrl.split('/');
     const bucket = 'whatsapp-images-2';
@@ -3960,8 +3891,6 @@ const extractTextFromImageFallback = async (imageUrl) => {
       console.error(`❌ No se pudo descargar imagen desde Supabase`);
       return "";
     }
-
-    console.log(`🔍 Analizando imagen temporal: ${tempFilePath}`);
     const [result] = await visionClient.textDetection(tempFilePath);
     const detections = result.textAnnotations;
     
@@ -3984,9 +3913,7 @@ const extractTextFromImageFallback = async (imageUrl) => {
 
 
 const extractTextFromDocument = async (documentPath, fileName) => {
-  try {
-    console.log(`📄 Intentando extraer texto de documento: ${fileName}`);
-    
+  try {    
     const fileExtension = path.extname(fileName).toLowerCase();
     
     // 🔍 Estrategia 1: Para PDFs, intentar con pdf-parse si está disponible
@@ -3998,7 +3925,6 @@ const extractTextFromDocument = async (documentPath, fileName) => {
         const pdfData = await pdfParse(dataBuffer);
         
         if (pdfData.text && pdfData.text.trim()) {
-          console.log(`✅ Texto extraído de PDF (${pdfData.text.length} caracteres):`, pdfData.text.substring(0, 200) + "...");
           return pdfData.text;
         }
       } catch (pdfError) {
@@ -4016,7 +3942,6 @@ const extractTextFromDocument = async (documentPath, fileName) => {
         
         if (detections && detections.length > 0) {
           const fullText = detections[0].description || "";
-          console.log(`📄 Texto detectado en PDF (${fullText.length} caracteres):`, fullText.substring(0, 200) + "...");
           return fullText;
         }
       } catch (visionError) {
@@ -4312,9 +4237,6 @@ const startApp = async () => {
     server.listen(port, () => {
       console.log(`✅ Servidor activo en puerto: ${port}`);
       console.log(`📱 Panel: http://localhost:${port}/scan`);
-      console.log(`🔗 Estado: http://localhost:${port}/session-health`);
-      console.log(`📊 Logs: http://localhost:${port}/messages-log`);
-      console.log("🤖 Bot iniciado - esperando conexión a WhatsApp");
     });
     
   } catch (error) {

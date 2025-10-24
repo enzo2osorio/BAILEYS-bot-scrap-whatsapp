@@ -31,14 +31,11 @@ const saveDestinatarioAliases = async (destinatarioId, aliases) => {
       
       // Si hay error de duplicado, intentar guardar uno por uno
       if (error.message.includes('duplicate') || error.message.includes('unique')) {
-        console.log("🔄 Intentando guardar aliases uno por uno...");
         return await saveAliasesOneByOne(destinatarioId, aliases);
       }
       
       return false;
     }
-    
-    console.log(`✅ ${data.length} aliases guardados exitosamente`);
     return true;
     
   } catch (error) {
@@ -63,13 +60,11 @@ const saveAliasesOneByOne = async (destinatarioId, aliases) => {
       
       if (error) {
         if (error.message.includes('duplicate') || error.message.includes('unique')) {
-          console.log(`⚠️ Alias "${alias}" ya existe - omitido`);
         } else {
           console.error(`❌ Error guardando alias "${alias}":`, error.message);
           errorCount++;
         }
       } else {
-        console.log(`✅ Alias "${alias}" guardado`);
         savedCount++;
       }
       

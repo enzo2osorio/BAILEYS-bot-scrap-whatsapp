@@ -5,8 +5,6 @@ const supabase = require("../supabase");
 // 🔍 Verificar aliases duplicados antes de guardar
 const checkDuplicateAliases = async (aliases) => {
   try {
-    console.log(`🔍 Verificando ${aliases.length} aliases contra duplicados...`);
-    
     // Obtener todos los aliases existentes de la base de datos
     const { data: existingAliases, error } = await supabase
       .from('destinatario_aliases')
@@ -27,9 +25,6 @@ const checkDuplicateAliases = async (aliases) => {
     const existingAliasesSet = new Set(
       (existingAliases || []).map(item => item.alias.toLowerCase().trim())
     );
-    
-    console.log(`📋 ${existingAliasesSet.size} aliases existentes en base de datos`);
-    
     // Separar aliases válidos de duplicados
     const validAliases = [];
     const duplicates = [];
@@ -42,10 +37,8 @@ const checkDuplicateAliases = async (aliases) => {
         console.log(`❌ Alias duplicado encontrado: "${alias}"`);
       } else {
         validAliases.push(alias);
-        console.log(`✅ Alias válido: "${alias}"`);
       }
     }
-    
     console.log(`✅ Verificación completada: ${validAliases.length} válidos, ${duplicates.length} duplicados`);
     
     return {

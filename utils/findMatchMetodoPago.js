@@ -3,8 +3,6 @@ const fuzz = require('fuzzball');
 
 const matchMetodoPago = async (inputMetodoPago) => {
   try {
-    console.log(`🔍 Buscando coincidencia para método de pago: "${inputMetodoPago}"`);
-    
     if (!inputMetodoPago || inputMetodoPago.trim() === '') {
       console.log("⚠️ Input de método de pago vacío");
       return { name: null, score: 0 };
@@ -33,11 +31,8 @@ const matchMetodoPago = async (inputMetodoPago) => {
       }
     }
 
-    console.log(`🎯 Mejor coincidencia: "${bestMatch.name}" con ${bestMatch.score}% de similitud`);
-
     // Solo devolver el match si supera el umbral
-    if (bestMatch.score >= UMBRAL_MINIMO) {
-      console.log(`✅ Coincidencia válida encontrada: ${bestMatch.name} (${bestMatch.score}%)`);
+    if (bestMatch.score >= UMBRAL_MINIMO) {     
       return bestMatch;
     } else {
       console.log(`❌ No se encontró coincidencia válida. Mejor score: ${bestMatch.score}% (mínimo: ${UMBRAL_MINIMO}%)`);
