@@ -2787,9 +2787,6 @@ const proceedToFinalConfirmationWithMetodoPago = async (jid, metodoPagoName, str
 };
 
 
-  const pad2 = (n) => String(n).padStart(2, '0');
-
-
 
   // 🔄 Manejar selección de la lista completa de destinatarios
   const handleChoosingInListOrAddingNew = async (jid, textMessage, userState, quotedMsg) => {

@@ -1,3 +1,5 @@
+    const pad2 = (n) => String(n).padStart(2, '0');
+
   const normalizeDateTime = (data) => {
     // data.fecha: dd/mm/yyyy (opcional)
     // data.hora:  HH:mm       (opcional)
