@@ -71,6 +71,55 @@ let WA_IS_LATEST = false;
 let isConnecting = false;
 let reconnectTimer = null;
 
+// 🚨 DETECTOR DE ERRORES 428 FRECUENTES
+const error428Tracker = {
+  errors: [],
+  maxErrors: 5,
+  timeWindow: 25 * 60 * 1000, // 25 minutos
+  
+  addError() {
+    const now = Date.now();
+    this.errors.push(now);
+    
+    // Limpiar errores antiguos
+    this.errors = this.errors.filter(time => now - time <= this.timeWindow);
+    
+    console.log(`📊 Error 428 registrado. Total en ventana: ${this.errors.length}/${this.maxErrors}`);
+    
+    // Si alcanzamos el límite, activar auto-recovery
+    if (this.errors.length >= this.maxErrors) {
+      console.log('🚨 UMBRAL 428 ALCANZADO - Activando auto-recovery preventivo');
+      this.triggerPreventiveRecovery();
+    }
+  },
+  
+  async triggerPreventiveRecovery() {
+    try {
+      console.log('🔄 Iniciando recovery preventivo por exceso de 428s...');
+      
+      // Pausar por 2 minutos antes de reconectar
+      await stopBaileysGracefully();
+      console.log('⏸️ WhatsApp pausado preventivamente');
+      
+      setTimeout(async () => {
+        try {
+          console.log('🔄 Reactivando tras pausa preventiva...');
+          await connectToWhatsApp();
+          console.log('✅ Recovery preventivo completado');
+          
+          // Reset del contador tras recovery exitoso
+          this.errors = [];
+        } catch (e) {
+          console.log('❌ Falló recovery preventivo:', e.message);
+        }
+      }, 2 * 60 * 1000); // 2 minutos
+      
+    } catch (e) {
+      console.log('❌ Error en recovery preventivo:', e.message);
+    }
+  }
+};
+
 const DEST_SCORE_MIN_LIST = parseFloat(process.env.DEST_SCORE_MIN_LIST || '0.65');   // debajo => forzar lista
 const DEST_SCORE_MIN_AUTO = parseFloat(process.env.DEST_SCORE_MIN_AUTO || '0.85');   // arriba => autoaceptar
 const METODO_PAGO_SCORE_MIN_LIST = parseFloat(process.env.METODO_PAGO_SCORE_MIN_LIST || '0.60'); // debajo => lista
@@ -570,10 +619,31 @@ const { normalizeDateTime } = require("./utils/normalizeDateTime.js");
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
 
-app.get("/scan", (req, res) => {
+app.get("/scan", ( res) => {
   res.sendFile("./client/index.html", {
     root: __dirname,
   });
+});
+
+// Health check endpoint para Render
+app.get("/health", ( res) => {
+  const healthStatus = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    version: process.env.npm_package_version || '1.0.0',
+    whatsapp: {
+      connected: sock?.user?.id ? true : false,
+      userId: sock?.user?.id || null,
+      connectionState: sock?.ws?.readyState || 'disconnected'
+    },
+    mongo: {
+      connected: global.__MONGO_CLIENT_INSTANCE ? true : false
+    }
+  };
+  
+  res.status(200).json(healthStatus);
 });
 
 app.get("/", (req, res) => {
@@ -722,6 +792,113 @@ app.get("/session-status/:accessKey", (req, res) => {
     res.status(500).json({
       success: false,
       message: "❌ Error obteniendo estado",
+      error: error.message
+    });
+  }
+});
+
+// 🔄 ENDPOINT DE RECOVERY MANUAL PARA CRON JOBS
+app.get("/force-recovery/:accessKey", async (req, res) => {
+  try {
+    const { accessKey } = req.params;
+    const validAccessKey = process.env.SESSION_CLEAR_KEY || "default-clear-key-12345";
+    
+    if (accessKey !== validAccessKey) {
+      return res.status(401).json({
+        success: false,
+        message: "❌ Clave de acceso inválida"
+      });
+    }
+
+    console.log('🔄 Recovery manual iniciado vía endpoint...');
+    
+    // Verificar si el bot está realmente inactivo
+    const isActive = sock?.user?.id && sock?.ws?.readyState === 1;
+    
+    if (isActive) {
+      return res.status(200).json({
+        success: true,
+        message: "✅ Bot ya está activo - no se requiere recovery",
+        status: {
+          connected: true,
+          userId: sock.user.id,
+          uptime: process.uptime()
+        }
+      });
+    }
+
+    // Forzar reconexión
+    try {
+      await connectToWhatsApp();
+      
+      res.status(200).json({
+        success: true,
+        message: "✅ Recovery manual completado",
+        timestamp: new Date().toISOString(),
+        action: "force_reconnect_completed"
+      });
+      
+    } catch (e) {
+      console.log('❌ Falló recovery manual:', e.message);
+      
+      res.status(500).json({
+        success: false,
+        message: "❌ Recovery manual falló",
+        error: e.message,
+        suggestion: "Intenta reiniciar el servicio completo"
+      });
+    }
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "❌ Error en recovery endpoint",
+      error: error.message
+    });
+  }
+});
+
+// 📊 ENDPOINT DE ESTADÍSTICAS 428
+app.get("/stats-428/:accessKey", (req, res) => {
+  try {
+    const { accessKey } = req.params;
+    const validAccessKey = process.env.SESSION_CLEAR_KEY || "default-clear-key-12345";
+    
+    if (accessKey !== validAccessKey) {
+      return res.status(401).json({
+        success: false,
+        message: "❌ Clave de acceso inválida"
+      });
+    }
+
+    const now = Date.now();
+    const recentErrors = error428Tracker.errors.filter(time => 
+      now - time <= error428Tracker.timeWindow
+    );
+
+    res.status(200).json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      error428Stats: {
+        recentErrors: recentErrors.length,
+        maxErrors: error428Tracker.maxErrors,
+        timeWindow: `${Math.round(error428Tracker.timeWindow/60000)} minutos`,
+        nextReset: recentErrors.length > 0 ? 
+          new Date(Math.min(...recentErrors) + error428Tracker.timeWindow).toISOString() : 
+          'No hay errores recientes',
+        shouldTriggerRecovery: recentErrors.length >= error428Tracker.maxErrors
+      },
+      botStatus: {
+        connected: sock?.user?.id ? true : false,
+        uptime: process.uptime(),
+        mongoConnected: global.__MONGO_CLIENT_INSTANCE ? true : false
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "❌ Error obteniendo estadísticas",
       error: error.message
     });
   }
@@ -1361,11 +1538,44 @@ const P = require("pino")({
   level: "silent",
 });
 
-//PARTE
+//PARTE - RESISTENCIA A SIGTERM MEJORADA
 const graceful = async (signal) => {
-  console.log(`\n${signal} recibido. Cerrando conexiones Mongo...`);
-  await closeClient().catch(()=>{});
-  process.exit(0);
+  console.log(`\n🔄 ${signal} recibido. Aplicando estrategia de persistencia...`);
+  
+  if (signal === 'SIGTERM') {
+    // SIGTERM desde Render - NO cerrar Mongo, solo pausar operaciones
+    console.log('🛡️ SIGTERM detectado: pausando operaciones pero manteniendo conexiones');
+    
+    try {
+      // Pausar WhatsApp pero mantener Mongo vivo
+      await stopBaileysGracefully();
+      console.log('⏸️ WhatsApp pausado - Mongo permanece activo');
+      
+      // Programar auto-recuperación en 30 segundos
+      setTimeout(async () => {
+        console.log('🔄 Auto-recuperación iniciada tras SIGTERM...');
+        try {
+          await connectToWhatsApp();
+          console.log('✅ Bot recuperado exitosamente');
+        } catch (e) {
+          console.log('❌ Falló auto-recuperación, reintentando en 60s...', e.message);
+          setTimeout(() => process.exit(1), 60000); // Si todo falla, exit controlado
+        }
+      }, 30000);
+      
+      // NO hacer process.exit - dejar que Render decida
+      return;
+    } catch (e) {
+      console.log('❌ Error en manejo SIGTERM:', e.message);
+    }
+  }
+  
+  // Para SIGINT (Ctrl+C) sí cerrar todo correctamente
+  if (signal === 'SIGINT') {
+    console.log('🔄 SIGINT recibido. Cerrando conexiones Mongo...');
+    await closeClient().catch(()=>{});
+    process.exit(0);
+  }
 };
 
 async function showAllMetodosPagoList(jid, structuredData) {
@@ -1869,14 +2079,17 @@ const msgRetryCounterCache = new NodeCache();
         break;
         
       case 428: {
-    console.log("🚫 Error 428: Connection Terminated - soft restart sin process.exit");
+    console.log("🚫 Error 428: Connection Terminated - registrando en tracker");
+    
+    // 📊 Registrar error en el tracker
+    error428Tracker.addError();
 
     // Notificación (rate limited 30 min)
     if (!global.last428NotifyAt || Date.now() - global.last428NotifyAt > 30 * 60 * 1000) {
       const notifyJid = process.env.MY_NUMBER || process.env.NUMBER_1_ALLOWED;
       if (notifyJid) {
         await safeSendMessage(notifyJid, {
-          text: "⚠️ La sesión de WhatsApp marcó 428. Reiniciando bot y reconectando..."
+          text: `⚠️ Error 428 detectado (${error428Tracker.errors.length}/${error428Tracker.maxErrors} en ${Math.round(error428Tracker.timeWindow/60000)}min). Auto-recovery activará si continúa.`
         }).catch(()=>{});
       }
       global.last428NotifyAt = Date.now();
