@@ -40,7 +40,7 @@ async function findCuentaLinkByIds(ownerId, metodoId) {
   try {
     const { data, error } = await supabase
       .from('metodo_pago_destinatario_duenos')
-      .select('id, description')
+      .select('id, description, destinatario_id')
       .eq('destinatario_id', ownerId)
       .eq('metodo_pago_id', metodoId)
       .maybeSingle();
@@ -88,4 +88,4 @@ async function createCuentaContableLink(ownerId, metodoId, description) {
   }
 }
 
-module.exports = { cuentaLinkExists, createCuentaContableLink };
+module.exports = { cuentaLinkExists, createCuentaContableLink, findCuentaLinkByIds };

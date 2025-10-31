@@ -24,7 +24,6 @@ const { buildCategorizedDestinatariosMessage } = require('./utils/destinatarios/
 const dotenv = require("dotenv");
 const openAI = require("openai");
 const vision = require("@google-cloud/vision");
-const destinatarios = require('./similarDestinatarios.js');
 const matchDestinatario = require('./utils/findMatchDestinatario.js');
 const supabase = require('./supabase.js');
 const { initInstanceLock, getActiveLockInfo } = require('./utils/mongo/lock-mongo.js');
@@ -45,6 +44,7 @@ const { cuentaLinkExists, createCuentaContableLink } = require("./utils/destinat
 const { getOwnerIdByNameStrict } = require("./utils/destinatarios/getOwnerIdByName.js");
 const { getMetodoPagoIdByNameStrict } = require("./utils/destinatarios/getMetodoPagoIdByName.js");
 const { validateFinalData, isKnownMedioPago, cleanAmount } = require("./utils/errorValidations.js");
+const { fetchRecordsWithAllStuff, fetchRecordWithAllStuffById } = require("./utils/fetchRecordsFromSupabase.js");
 
 dotenv.config();
 
@@ -506,7 +506,517 @@ async function handleCreateCuentaOwnerSelectionDynamic(jid, textMessage, userSta
   await showMetodosPagoForCuentaLink(jid, updated);
 }
 
+// 📋 ===============================
+// SISTEMA DE LISTADO DE REGISTROS
+// ===============================
 
+// 🗓️ Función para parsear fecha dd/mm/yyyy
+function parseListDate(dateStr) {
+  if (!dateStr || typeof dateStr !== 'string') return null;
+  
+  const cleaned = dateStr.trim();
+  const match = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  
+  if (!match) return null;
+  
+  const [, day, month, year] = match;
+  const dayNum = parseInt(day, 10);
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+  
+  // Validaciones básicas
+  if (dayNum < 1 || dayNum > 31) return null;
+  if (monthNum < 1 || monthNum > 12) return null;
+  if (yearNum < 2020 || yearNum > 2030) return null;
+  
+  const date = new Date(yearNum, monthNum - 1, dayNum);
+  
+  // Verificar que la fecha sea válida
+  if (date.getDate() !== dayNum || date.getMonth() !== monthNum - 1 || date.getFullYear() !== yearNum) {
+    return null;
+  }
+  
+  return date;
+}
+
+// 📅 Generar fechas para hotkeys
+function getHotkeyDates() {
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  
+  const dayBeforeYesterday = new Date(today);
+  dayBeforeYesterday.setDate(dayBeforeYesterday.getDate() - 2);
+  
+  // Lunes de esta semana
+  const monday = new Date(today);
+  const dayOfWeek = today.getDay();
+  const daysFromMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1; // Si es domingo, se le asigna 6 para realizar bien el calculo del lunes.
+  monday.setDate(monday.getDate() - daysFromMonday);
+  
+  // Domingo de esta semana
+  const sunday = new Date(monday);
+  sunday.setDate(sunday.getDate() + 6);
+  
+  const formatDate = (date) => {
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const year = date.getFullYear();
+    return `${day}/${month}/${year}`;
+  };
+  
+  return {
+    today: { start: formatDate(today), end: formatDate(today) },
+    yesterday: { start: formatDate(yesterday), end: formatDate(yesterday) },
+    dayBeforeYesterday: { start: formatDate(dayBeforeYesterday), end: formatDate(dayBeforeYesterday) },
+    week: { start: formatDate(monday), end: formatDate(sunday) }
+  };
+}
+
+// 🚀 Iniciar flujo de listado
+async function startListFlow(jid) {
+  const hotkeys = getHotkeyDates();
+  
+  const message = `📋 *Listar registros*
+
+📅 Escribe la fecha de inicio en formato: dd/mm/yyyy
+O usa las siguientes opciones:
+
+0. ❌ Cancelar
+1. 📅 Registros de hoy
+2. 📅 Registros de ayer  
+3. 📅 Registros de anteayer
+4. 📅 Registros de toda la semana (lunes a domingo)
+
+Ejemplo: 15/10/2024`;
+
+  setUserState(jid, STATES.AWAITING_LIST_START_DATE, { hotkeys });
+  await safeSendMessage(jid, { text: message });
+}
+
+
+
+// 📋 Formatear y mostrar registros
+function formatRecordsList(records, startIndex = 1) {
+  if (!records || records.length === 0) {
+    return "📋 No se encontraron registros en el rango especificado.";
+  }
+  
+  let formatted = `📋 *Registros encontrados:*\n\n`;
+  
+  records.forEach((record, index) => {
+    const displayIndex = startIndex + index;
+    const monto = cleanAmount(record.monto);
+    const montoStr = (typeof monto === 'number') ? `$${monto}` : `$${monto}`;
+    const cuentaDescription = record.metodo_pago_destinatario_duenos?.description || record.cuenta_contable || 'Sin descripción';
+    
+    formatted += `${displayIndex}. *${record.destinatario || 'Sin destinatario'}*\n`;
+    formatted += `   💰 Monto: ${montoStr}\n`;
+    formatted += `   📊 Tipo: ${record.tipo_movimiento || 'No especificado'}\n`;
+    formatted += `   🏦 Cuenta: ${cuentaDescription}\n`;
+    formatted += `   📅 Fecha: ${record.fecha || 'Sin fecha'}\n\n`;
+  });
+  
+  return formatted;
+}
+
+// 🎯 Mostrar opciones de acción después del listado
+function getListActionOptions(hasMore = false, isFirstBatch = true) {
+  let options = '';
+  
+  if (hasMore) {
+    options += '1. ➡️ Continuar con los demás registros\n';
+    options += '2. ✏️ Modificar un registro\n';
+    options += '3. 🗑️ Eliminar un registro\n';
+    options += '0. ❌ Terminar listado';
+  } else {
+    options += '1. ✏️ Modificar un registro\n';
+    options += '2. 🗑️ Eliminar un registro\n';
+    options += '0. ❌ Cancelar';
+  }
+  
+  return options;
+}
+
+// 📝 Manejar selección de fecha de inicio
+async function handleListStartDate(jid, textMessage, userState) {
+  const input = textMessage.trim();
+  const hotkeys = userState?.data?.hotkeys;
+  
+  // Manejar hotkeys
+  if (input === '0') {
+    clearUserState(jid);
+    await safeSendMessage(jid, { text: '❌ Listado cancelado.' });
+    return;
+  }
+  
+  if (hotkeys) {
+    let dateRange = null;
+    
+    switch (input) {
+      case '1': dateRange = hotkeys.today; break;
+      case '2': dateRange = hotkeys.yesterday; break;
+      case '3': dateRange = hotkeys.dayBeforeYesterday; break;
+      case '4': dateRange = hotkeys.week; break;
+    }
+    
+    if (dateRange) {
+      // Usar ambas fechas del hotkey
+      const startDate = parseListDate(dateRange.start);
+      const endDate = parseListDate(dateRange.end);
+      
+      if (startDate && endDate) {
+        await processDateRangeAndShowRecords(jid, startDate, endDate);
+        return;
+      }
+    }
+  }
+  
+  // Parsear fecha manual
+  const startDate = parseListDate(input);
+  
+  if (!startDate) {
+    await safeSendMessage(jid, { 
+      text: '❌ Formato de fecha incorrecto. Usa el formato dd/mm/yyyy (ejemplo: 15/10/2024) o selecciona una opción numérica.' 
+    });
+    return;
+  }
+  
+  // Solicitar fecha de fin
+  setUserState(jid, STATES.AWAITING_LIST_END_DATE, { startDate });
+  await safeSendMessage(jid, { 
+    text: '📅 Ahora escribe la fecha de fin en formato dd/mm/yyyy:' 
+  });
+}
+
+// 📝 Manejar selección de fecha de fin
+async function handleListEndDate(jid, textMessage, userState) {
+  const input = textMessage.trim();
+  const startDate = userState?.data?.startDate;
+  
+  if (!startDate) {
+    clearUserState(jid);
+    await safeSendMessage(jid, { text: '❌ Error: No se encontró la fecha de inicio. Reinicia el listado.' });
+    return;
+  }
+  
+  const endDate = parseListDate(input);
+  
+  if (!endDate) {
+    await safeSendMessage(jid, { 
+      text: '❌ Formato de fecha incorrecto. Usa el formato dd/mm/yyyy (ejemplo: 20/10/2024)' 
+    });
+    return;
+  }
+  
+  // Validar que la fecha de inicio no sea mayor que la de fin
+  if (startDate > endDate) {
+    await safeSendMessage(jid, { 
+      text: '❌ La fecha de inicio no puede ser mayor que la fecha de fin. Escribe nuevamente la fecha de fin:' 
+    });
+    return;
+  }
+  
+  await processDateRangeAndShowRecords(jid, startDate, endDate);
+}
+
+// 🔄 Procesar rango de fechas y mostrar registros
+async function processDateRangeAndShowRecords(jid, startDate, endDate, offset = 0) {
+  try {
+    await safeSendMessage(jid, { text: '🔍 Buscando registros...' });
+    
+    const result = await fetchRecordsWithAllStuff(startDate, endDate, offset, 50);
+    const { records, totalCount, hasMore } = result;
+    
+    if (records.length === 0 && offset === 0) {
+      clearUserState(jid);
+      await safeSendMessage(jid, { 
+        text: '📋 No se encontraron registros en el rango especificado.' 
+      });
+      return;
+    }
+    
+    if (records.length === 0 && offset > 0) {
+      clearUserState(jid);
+      await safeSendMessage(jid, { 
+        text: '📋 No hay más registros para mostrar.' 
+      });
+      return;
+    }
+    
+    // Formatear y enviar lista de registros
+    const startIndex = offset + 1;
+    const formattedList = formatRecordsList(records, startIndex);
+    
+    // Información de paginación
+    let paginationInfo = '';
+    if (totalCount > 50) {
+      const currentEnd = Math.min(offset + records.length, totalCount);
+      paginationInfo = `\n📊 Mostrando ${offset + 1}-${currentEnd} de ${totalCount} registros\n\n`;
+    }
+    
+    // Opciones de acción
+    const actionOptions = getListActionOptions(hasMore, offset === 0);
+    
+    const fullMessage = formattedList + paginationInfo + '¿Qué deseas hacer?\n\n' + actionOptions + '\n\nEscribe el número de tu opción:';
+    
+    // Guardar estado con datos necesarios
+    setUserState(jid, STATES.AWAITING_LIST_ACTION_SELECTION, {
+      records,
+      startDate,
+      endDate,
+      offset,
+      hasMore,
+      totalCount,
+      startIndex
+    });
+    
+    await safeSendMessage(jid, { text: fullMessage });
+    
+  } catch (error) {
+    console.error('❌ Error en processDateRangeAndShowRecords:', error);
+    clearUserState(jid);
+    await safeSendMessage(jid, { 
+      text: '❌ Error al buscar registros. Inténtalo de nuevo más tarde.' 
+    });
+  }
+}
+
+// 🎯 Manejar selección de acción sobre la lista
+async function handleListActionSelection(jid, textMessage, userState) {
+  const option = parseInt(textMessage.trim(), 10);
+  const { records, startDate, endDate, offset, hasMore, totalCount, startIndex } = userState?.data || {};
+  
+  if (!records) {
+    clearUserState(jid);
+    await safeSendMessage(jid, { text: '❌ Error: No se encontraron datos de la lista. Reinicia el listado.' });
+    return;
+  }
+  
+  if (isNaN(option)) {
+    await safeSendMessage(jid, { text: '❌ Por favor escribe un número válido.' });
+    return;
+  }
+  
+  // Opción 0: Cancelar/Terminar
+  if (option === 0) {
+    clearUserState(jid);
+    await safeSendMessage(jid, { text: '✅ Listado finalizado.' });
+    return;
+  }
+  
+  // Si hay más registros, las opciones se desplazan
+  if (hasMore) {
+    if (option === 1) {
+      // Continuar con más registros
+      const newOffset = offset + 50;
+      await processDateRangeAndShowRecords(jid, startDate, endDate, newOffset);
+      return;
+    } else if (option === 2) {
+      // Modificar registro
+      await startRecordModification(jid, userState.data);
+      return;
+    } else if (option === 3) {
+      // Eliminar registro  
+      await startRecordDeletion(jid, userState.data);
+      return;
+    } else {
+      await safeSendMessage(jid, { text: '❌ Opción inválida. Escribe 0, 1, 2 o 3.' });
+      return;
+    }
+  } else {
+    // No hay más registros
+    if (option === 1) {
+      // Modificar registro
+      await startRecordModification(jid, userState.data);
+      return;
+    } else if (option === 2) {
+      // Eliminar registro
+      await startRecordDeletion(jid, userState.data);
+      return;
+    } else {
+      await safeSendMessage(jid, { text: '❌ Opción inválida. Escribe 0, 1 o 2.' });
+      return;
+    }
+  }
+}
+
+// ✏️ Iniciar modificación de registro
+async function startRecordModification(jid, listData) {
+  const { records, startIndex } = listData;
+  const maxIndex = startIndex + records.length - 1;
+  
+  setUserState(jid, STATES.AWAITING_LIST_RECORD_INDEX, {
+    ...listData,
+    action: 'modify'
+  });
+  
+  await safeSendMessage(jid, { 
+    text: `✏️ Escribe el número del registro a modificar (${startIndex}-${maxIndex}):` 
+  });
+}
+
+// 🗑️ Iniciar eliminación de registro
+async function startRecordDeletion(jid, listData) {
+  const { records, startIndex } = listData;
+  const maxIndex = startIndex + records.length - 1;
+  
+  setUserState(jid, STATES.AWAITING_LIST_RECORD_INDEX, {
+    ...listData,
+    action: 'delete'
+  });
+  
+  await safeSendMessage(jid, { 
+    text: `🗑️ Escribe el número del registro a eliminar (${startIndex}-${maxIndex}):` 
+  });
+}
+
+// 🔢 Manejar selección de índice de registro
+async function handleListRecordIndex(jid, textMessage, userState) {
+  const index = parseInt(textMessage.trim(), 10);
+  const { records, startIndex, action } = userState?.data || {};
+  
+  if (!records || !action) {
+    clearUserState(jid);
+    await safeSendMessage(jid, { text: '❌ Error: No se encontraron datos. Reinicia el listado.' });
+    return;
+  }
+  
+  const maxIndex = startIndex + records.length - 1;
+  
+  if (isNaN(index) || index < startIndex || index > maxIndex) {
+    await safeSendMessage(jid, { 
+      text: `❌ Número inválido. Escribe un número entre ${startIndex} y ${maxIndex}.` 
+    });
+    return;
+  }
+  
+  // Encontrar el registro correspondiente
+  const recordArrayIndex = index - startIndex;
+  const selectedRecord = records[recordArrayIndex];
+  
+  if (!selectedRecord) {
+    await safeSendMessage(jid, { text: '❌ Error: No se encontró el registro seleccionado.' });
+    return;
+  }
+  
+  if (action === 'modify') {
+    await startRecordModificationProcess(jid, selectedRecord);
+  } else if (action === 'delete') {
+    await confirmRecordDeletion(jid, selectedRecord, userState.data);
+  }
+}
+
+// ✏️ Iniciar proceso de modificación de registro específico
+async function startRecordModificationProcess(jid, record) {
+  try {
+    // Obtener datos completos del registro desde Supabase
+    const singleRecord = await fetchRecordWithAllStuffById(record.id);
+
+    if (!singleRecord) {
+      console.error('Error obteniendo registro completo:', error);
+      clearUserState(jid);
+      await safeSendMessage(jid, { text: '❌ Error al obtener los datos del registro.' });
+      return;
+    }
+    
+    // Usar el flujo existente de confirmación/modificación
+    const structuredData = {
+      nombre: singleRecord.destinatario_name,
+      monto: singleRecord.monto,
+      fecha: singleRecord.fecha,
+      hora: singleRecord.hora,
+      tipo_movimiento: singleRecord.tipo_movimiento,
+      medio_pago: singleRecord.medio_pago,
+      cuenta_contable: singleRecord.cuenta_owner_name,
+      cuenta: singleRecord.cuenta_description || null,
+      recordId: singleRecord.id // Agregar ID para identificar que es una modificación
+    };
+    
+    // Mostrar datos actuales usando la función existente
+    const confirmationMessage = formatFinalConfirmation(structuredData, false);
+    
+    setUserState(jid, STATES.AWAITING_SAVE_CONFIRMATION, {
+      finalStructuredData: structuredData,
+      isModification: true
+    });
+    
+    await safeSendMessage(jid, { text: confirmationMessage });
+    
+  } catch (error) {
+    console.error('❌ Error en startRecordModificationProcess:', error);
+    clearUserState(jid);
+    await safeSendMessage(jid, { text: '❌ Error al procesar la modificación.' });
+  }
+}
+
+// 🗑️ Confirmar eliminación de registro
+async function confirmRecordDeletion(jid, record, listData) {
+  const monto = cleanAmount(record.monto);
+  const montoStr = (typeof monto === 'number') ? `$${monto}` : `$${monto}`;
+  const cuentaDescription = record.cuentaContableName || 'Sin descripción';
+  
+  const confirmationMessage = `🗑️ *¿Confirmas eliminar este registro?*\n\n` +
+    `👤 *Destinatario:* ${record.destinatarioName || 'Sin destinatario'}\n` +
+    `💰 *Monto:* ${montoStr}\n` +
+    `📊 *Tipo:* ${record.tipo_movimiento || 'No especificado'}\n` +
+    `🏦 *Cuenta:* ${cuentaDescription}\n` +
+    `📅 *Fecha:* ${record.fecha || 'Sin fecha'}\n\n` +
+    `1. ✅ Sí, eliminar\n` +
+    `2. ❌ No, cancelar\n\n` +
+    `Escribe el número de tu opción:`;
+  
+  setUserState(jid, STATES.AWAITING_DELETE_CONFIRMATION, {
+    recordToDelete: record,
+    listData
+  });
+  
+  await safeSendMessage(jid, { text: confirmationMessage });
+}
+
+// ✅ Procesar confirmación de eliminación
+async function handleDeleteConfirmation(jid, textMessage, userState) {
+  const option = parseInt(textMessage.trim(), 10);
+  const { recordToDelete } = userState?.data || {};
+  
+  if (!recordToDelete) {
+    clearUserState(jid);
+    await safeSendMessage(jid, { text: '❌ Error: No se encontró el registro a eliminar.' });
+    return;
+  }
+  
+  if (option === 2) {
+    clearUserState(jid);
+    await safeSendMessage(jid, { text: '❌ Eliminación cancelada.' });
+    return;
+  }
+  
+  if (option === 1) {
+    try {
+      // Eliminar registro de Supabase
+      const { error } = await supabase
+        .from('registros')
+        .delete()
+        .eq('id', recordToDelete.id);
+      
+      if (error) {
+        console.error('Error eliminando registro:', error);
+        await safeSendMessage(jid, { text: '❌ Error al eliminar el registro. Inténtalo de nuevo.' });
+        return;
+      }
+      
+      clearUserState(jid);
+      await safeSendMessage(jid, { text: '✅ Registro eliminado exitosamente.' });
+      
+    } catch (error) {
+      console.error('❌ Error en handleDeleteConfirmation:', error);
+      clearUserState(jid);
+      await safeSendMessage(jid, { text: '❌ Error al procesar la eliminación.' });
+    }
+  } else {
+    await safeSendMessage(jid, { text: '❌ Opción inválida. Escribe 1 para confirmar o 2 para cancelar.' });
+  }
+}
 
 async function resumeAllSessionsAfter428() {
   const marginMin = Math.ceil((INACTIVITY_TIMEOUT_MS / 60000) + 1); // inactividad + 1 min
@@ -595,6 +1105,13 @@ const STATES = {
   AWAITING_CMD_DESTINATARIO_LIST: "awaiting_cmd_destinatario_list",
   AWAITING_CMD_METODO_PAGO_LIST: "awaiting_cmd_metodo_pago_list",
   AWAITING_CMD_CUENTAS_LIST: "awaiting_cmd_cuentas_list",
+  
+  // 📋 Estados para el sistema de listado de registros
+  AWAITING_LIST_START_DATE: "awaiting_list_start_date",
+  AWAITING_LIST_END_DATE: "awaiting_list_end_date", 
+  AWAITING_LIST_ACTION_SELECTION: "awaiting_list_action_selection",
+  AWAITING_LIST_RECORD_INDEX: "awaiting_list_record_index",
+  AWAITING_DELETE_CONFIRMATION: "awaiting_delete_confirmation",
 };
 
 const { session } = { session: "session_auth_info" };
@@ -615,18 +1132,20 @@ const qrcode = require("qrcode");
 const { saveNewCategory, saveNewSubcategory } = require("./utils/saveNewCategory&Subcategory.js");
 const { listCuentaLinksWithNames, getOwnersDueños } = require("./utils/getOwnersDuenos.js");
 const { normalizeDateTime } = require("./utils/normalizeDateTime.js");
+const { updatingDestinatarioName, updatingDataFlow, updatingCuentaContableName } = require("./updateDataFlow.js");
+
 
 
 app.use("/assets", express.static(__dirname + "/client/assets"));
 
-app.get("/scan", ( res) => {
+app.get("/scan", (req, res) => {
   res.sendFile("./client/index.html", {
     root: __dirname,
   });
 });
 
 // Health check endpoint para Render
-app.get("/health", ( res) => {
+app.get("/health", (req, res) => {
   const healthStatus = {
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -1810,6 +2329,10 @@ const msgRetryCounterCache = new NodeCache();
               await showCuentasListView(jid);
               continue;
             }
+            if (cmd === 'listar') {
+              await startListFlow(jid);
+              continue;
+            }
           }
 
            if (userState.state === STATES.AWAITING_DESTINATARIO_CHOOSING_IN_LIST_OR_ADDING_NEW) {
@@ -1946,6 +2469,28 @@ const msgRetryCounterCache = new NodeCache();
             }
             if (userState.state === STATES.AWAITING_CMD_CUENTAS_LIST) {
               await handleCmdCuentasListSelection(jid, textMessage, userState, msg);
+              continue;
+            }
+            
+            // 📋 ESTADOS DEL SISTEMA DE LISTADO
+            if (userState.state === STATES.AWAITING_LIST_START_DATE) {
+              await handleListStartDate(jid, textMessage, userState);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_LIST_END_DATE) {
+              await handleListEndDate(jid, textMessage, userState);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_LIST_ACTION_SELECTION) {
+              await handleListActionSelection(jid, textMessage, userState);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_LIST_RECORD_INDEX) {
+              await handleListRecordIndex(jid, textMessage, userState);
+              continue;
+            }
+            if (userState.state === STATES.AWAITING_DELETE_CONFIRMATION) {
+              await handleDeleteConfirmation(jid, textMessage, userState);
               continue;
             }
           }
@@ -3479,7 +4024,7 @@ const handleSubcategorySelection = async (jid, subcategoriaId, userData) => {
     if (!proceed) return;
   };
 
-  // 💾 Guardar comprobante final
+  // 💾 Guardar comprobante final (nuevo o modificación)
 const saveComprobante = async (jid, userData) => {
   try {
     const normalized = normalizeDateTime(await ensureCuentaFields(userData.finalStructuredData || {}));
@@ -3492,15 +4037,30 @@ const saveComprobante = async (jid, userData) => {
       return;
     }
 
-    const result = await saveDataFirstFlow({
-      ...normalized,
-      fecha: normalized.fecha,
-      hora: normalized.hora,
-      fecha_iso: normalized.fecha_iso
-    });
+    const isModification = !!normalized.recordId;
+    let result;
+
+    if (isModification) {
+      const { recordId, ...updateData } = normalized;
+
+      const modifying = await updatingDataFlow(updateData)
+      result = modifying;
+      
+    } else {
+      // Crear nuevo registro
+      result = await saveDataFirstFlow({
+        ...normalized,
+        fecha: normalized.fecha,
+        hora: normalized.hora,
+        fecha_iso: normalized.fecha_iso
+      });
+    }
 
     if (result?.success) {
-      await safeSendMessage(jid, { text: "✅ Comprobante guardado exitosamente." });
+      const message = isModification 
+        ? "✅ Registro modificado exitosamente." 
+        : "✅ Comprobante guardado exitosamente.";
+      await safeSendMessage(jid, { text: message });
       await clearTempSessionForUser(jid);
       clearUserState(jid);
       return;
