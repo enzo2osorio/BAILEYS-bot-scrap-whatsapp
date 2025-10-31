@@ -30,8 +30,7 @@ async function fetchRecordsWithAllStuff(startDate, endDate, offset = 0, limit = 
         fecha,
         tipo_movimiento,
         metodo_pago_id,
-        cuenta_contable_id,        
-      `)
+        cuenta_contable_id`)
       .eq('origen', 'bot')
       .gte('fecha', startISO)
       .lte('fecha', endISO)
