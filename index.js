@@ -45,6 +45,11 @@ const { getOwnerIdByNameStrict } = require("./utils/destinatarios/getOwnerIdByNa
 const { getMetodoPagoIdByNameStrict } = require("./utils/destinatarios/getMetodoPagoIdByName.js");
 const { validateFinalData, isKnownMedioPago, cleanAmount } = require("./utils/errorValidations.js");
 const { fetchRecordsWithAllStuff, fetchRecordWithAllStuffById } = require("./utils/fetchRecordsFromSupabase.js");
+const { saveNewCategory, saveNewSubcategory } = require("./utils/saveNewCategory&Subcategory.js");
+const { listCuentaLinksWithNames, getOwnersDueños } = require("./utils/getOwnersDuenos.js");
+const { normalizeDateTime } = require("./utils/normalizeDateTime.js");
+const {  updatingDataFlow } = require("./updateDataFlow.js");
+
 
 dotenv.config();
 
@@ -1129,10 +1134,7 @@ const server = require("http").createServer(app);
 const io = require("socket.io")(server);
 const port = process.env.PORT || 8000;
 const qrcode = require("qrcode");
-const { saveNewCategory, saveNewSubcategory } = require("./utils/saveNewCategory&Subcategory.js");
-const { listCuentaLinksWithNames, getOwnersDueños } = require("./utils/getOwnersDuenos.js");
-const { normalizeDateTime } = require("./utils/normalizeDateTime.js");
-const { updatingDestinatarioName, updatingDataFlow, updatingCuentaContableName } = require("./updateDataFlow.js");
+
 
 
 

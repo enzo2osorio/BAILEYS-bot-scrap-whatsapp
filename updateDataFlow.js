@@ -1,4 +1,4 @@
-import supabase from "./supabase";
+const supabase = require("./supabase");
 
 async function getDestinatarioIdByName(destinatarioName) {
     
@@ -72,6 +72,4 @@ async function updatingDataFlow(updateData) {
 
 }
 
-export {
-  updatingDataFlow
-};
+module.exports = { updatingDataFlow };
