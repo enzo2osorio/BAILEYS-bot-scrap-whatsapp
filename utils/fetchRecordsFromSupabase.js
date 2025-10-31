@@ -42,23 +42,48 @@ async function fetchRecordsWithAllStuff(startDate, endDate, offset = 0, limit = 
       return { records: [], totalCount: count || 0, hasMore: false };
     }
 
-    const registrosWDestinatarios = await Promise.all(records.map(async (async registro => {
-        const destinatarioName = await supabase.from('destinatarios')
+    const registrosWDestinatarios = await Promise.all(records.map(async (registro) => {
+        const { data: destinatario } = await supabase.from('destinatarios')
           .select('name')
           .eq('id', registro.destinatario_id)
           .maybeSingle();
-        return { ...registro, destinatarioName };
-    })))
+        return { 
+          ...registro, 
+          destinatario_nombre: destinatario?.name || 'Sin destinatario'
+        };
+    }));
 
-    const previousRegistrosWCuentasContables = await Promise.all(registrosWDestinatarios.map(async(registro) => {
-        const cuentaContableName = await findCuentaLinkByIds(registro.destinatario_id, registro.metodo_pago_id);
-        return { ...registro, cuentaContableName: cuentaContableName?.description || null };
-    }))
+    const registrosWMetodoPago = await Promise.all(registrosWDestinatarios.map(async(registro) => {
+        const { data: metodoPago } = await supabase.from('metodos_pago')
+          .select('name')
+          .eq('id', registro.metodo_pago_id)
+          .maybeSingle();
+        return { 
+          ...registro, 
+          metodo_pago_nombre: metodoPago?.name || 'Sin método de pago'
+        };
+    }));
+
+    const registrosWCuentaContable = await Promise.all(registrosWMetodoPago.map(async(registro) => {
+        const cuentaInfo = await findCuentaLinkByIds(registro.destinatario_id, registro.metodo_pago_id);
+        
+        // Obtener nombre del dueño/destinatario
+        const { data: dueno } = await supabase.from('destinatarios')
+          .select('name')
+          .eq('id', registro.cuenta_contable_id || registro.destinatario_id)
+          .maybeSingle();
+        
+        return { 
+          ...registro, 
+          cuenta_contable_descripcion: cuentaInfo?.description || `${registro.metodo_pago_nombre} de ${dueno?.name || 'Sin dueño'}`,
+          dueno_nombre: dueno?.name || 'Sin dueño'
+        };
+    }));
     
     const hasMore = (offset + limit) < (count || 0);
     
     return { 
-      records: previousRegistrosWCuentasContables || [], 
+      records: registrosWCuentaContable || [], 
       totalCount: count || 0, 
       hasMore 
     };
@@ -85,34 +110,46 @@ async function fetchRecordWithAllStuffById( recordId) {
     }
 
     const registrosWDestinatarios = await Promise.all([singleRecord].map(async (registro) => {
-        const destinatarioName = await getDestinatarios(registro.destinatario_id);
-        return { ...registro, destinatario_name: destinatarioName };
-    }))
+        const { data: destinatario } = await supabase.from('destinatarios')
+          .select('name')
+          .eq('id', registro.destinatario_id)
+          .maybeSingle();
+        return { 
+          ...registro, 
+          destinatario_nombre: destinatario?.name || 'Sin destinatario'
+        };
+    }));
 
-    const previousRegistrosWCuentasContables = await Promise.all(registrosWDestinatarios.map(async(registro) => {
+    const registrosWCuentaContable = await Promise.all(registrosWDestinatarios.map(async(registro) => {
         const cuentaContableInfo = await findCuentaLinkByIds(registro.destinatario_id, registro.metodo_pago_id);
         
-        //podria haber spliteado la descripcion, ya que todos siguen el formato "metodo pago - de - destinatario",
-        // pero prefiero hacerlo bien con querys, por si se cambia ese formato. 
-        const cuentaName = await supabase
+        // Obtener nombre del dueño/destinatario de la cuenta contable
+        const { data: dueno } = await supabase
           .from('destinatarios')
           .select('name')
-          .eq('id', cuentaContableInfo?.destinatario_id)
+          .eq('id', cuentaContableInfo?.destinatario_id || registro.destinatario_id)
           .maybeSingle();
         
-        return { ...registro, cuenta_description: cuentaContableInfo?.description || null, cuenta_owner_name: cuentaName?.data?.name || null };
-    }))
+        return { 
+          ...registro, 
+          cuenta_contable_descripcion: cuentaContableInfo?.description || null, 
+          dueno_nombre: dueno?.name || null 
+        };
+    }));
     
-    const previosRegistrosWMedioPago = await Promise.all(previousRegistrosWCuentasContables.map(async (registro) => {
-        const medioPagoName = await supabase
+    const registrosWMedioPago = await Promise.all(registrosWCuentaContable.map(async (registro) => {
+        const { data: metodoPago } = await supabase
           .from('metodos_pago')
           .select('name')
           .eq('id', registro.metodo_pago_id)
           .maybeSingle();
-        return { ...registro, medio_pago: medioPagoName?.data?.name || null };
-    }))
+        return { 
+          ...registro, 
+          metodo_pago_nombre: metodoPago?.name || null 
+        };
+    }));
 
-    return previosRegistrosWMedioPago;
+    return registrosWMedioPago;
     
   } catch (error) {
     console.error('❌ Error en fetchRecordsWithAllStuff:', error);

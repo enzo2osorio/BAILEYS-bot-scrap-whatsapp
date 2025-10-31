@@ -43,22 +43,21 @@ async function getCuentaContableIdByName(cuentaContableDescription) {
     return cuentaContable.id;
 }
 
-async function updatingDataFlow(updateData) {
+async function updatingDataFlow(updateData, recordId) {
 
     const newDestinatarioId = await getDestinatarioIdByName(updateData.nombre);
     const newMetodoPagoId = await getMetodoPagoIdByName(updateData.medio_pago);
-    const newCuentaContableId = await getCuentaContableIdByName(updateData.cuenta_contable);    
+    const newCuentaContableId = await getCuentaContableIdByName(updateData.cuenta_contable_descripcion);    
 
     const { data, error } = await supabase
         .from('registros')
         .update({
             destinatario_id: newDestinatarioId,
             monto: updateData.monto,
-            fecha: updateData.fecha,
+            fecha: updateData.fecha_iso || updateData.fecha,
             tipo_movimiento: updateData.tipo_movimiento,
             metodo_pago_id: newMetodoPagoId,
             cuenta_contable_id: newCuentaContableId,
-            fecha: updateData.fecha_iso,
             updated_at: new Date().toISOString()
         })
         .eq('id', recordId)

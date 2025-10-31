@@ -324,11 +324,11 @@ async function resumeSessionIfExists(userId) {
 function formatFinalConfirmation(data, updated = false) {
   const montoVal = cleanAmount(data.monto);
   const montoStr = (typeof montoVal === 'number') ? `$${montoVal}` : (String(montoVal).startsWith('$') ? montoVal : `$${montoVal}`);
-  const cuentaContable = data.cuenta_contable || 'No especificada';
-  // "cuenta" es la descripción humana de la cuenta (desde la tabla intermedia). Si no existe, armar fallback.
-  const cuentaDescripcion = data.cuenta || (data.medio_pago && data.cuenta_contable
-    ? `${data.medio_pago} de ${data.cuenta_contable}`
-    : 'No especificada');
+  
+  // Usar nombres consistentes: dueno_nombre y cuenta_contable_descripcion
+  const duenoNombre = data.dueno_nombre || data.cuenta_contable || 'No especificado';
+  const cuentaDescripcion = data.cuenta_contable_descripcion || 
+    (data.medio_pago && duenoNombre ? `${data.medio_pago} de ${duenoNombre}` : 'No especificada');
 
   return `📋 *Datos del comprobante ${updated ? " (actualizados)" : ""}:*\n\n` +
     `👤 *Destinatario:* ${data.nombre || 'No especificado'}\n` +
@@ -336,8 +336,8 @@ function formatFinalConfirmation(data, updated = false) {
     `📅 *Fecha:* ${data.fecha || 'No especificada'}\n` +
     `📊 *Tipo:* ${data.tipo_movimiento || 'No especificado'}\n` +
     `💳 *Método de pago:* ${data.medio_pago || 'No especificado'}\n` +
-    `🏦 *Cuenta contable:* ${cuentaContable}\n` +
-    `🧾 *Cuenta:* ${cuentaDescripcion}\n\n` +
+    `👤 *Dueño de cuenta:* ${duenoNombre}\n` +
+    `🧾 *Cuenta contable:* ${cuentaDescripcion}\n\n` +
     `¿Deseas guardar estos datos?\n\n1. 💾 Guardar\n2. ✏️ Modificar\n3. ❌ Cancelar\n\nEscribe el número de tu opción:`;
 }
 
@@ -613,12 +613,11 @@ function formatRecordsList(records, startIndex = 1) {
     const displayIndex = startIndex + index;
     const monto = cleanAmount(record.monto);
     const montoStr = (typeof monto === 'number') ? `$${monto}` : `$${monto}`;
-    const cuentaDescription = record.metodo_pago_destinatario_duenos?.description || record.cuenta_contable || 'Sin descripción';
     
-    formatted += `${displayIndex}. *${record.destinatario || 'Sin destinatario'}*\n`;
+    formatted += `${displayIndex}. *${record.destinatario_nombre || 'Sin destinatario'}*\n`;
     formatted += `   💰 Monto: ${montoStr}\n`;
     formatted += `   📊 Tipo: ${record.tipo_movimiento || 'No especificado'}\n`;
-    formatted += `   🏦 Cuenta: ${cuentaDescription}\n`;
+    formatted += `   🏦 Cuenta: ${record.cuenta_contable_descripcion || 'Sin descripción'}\n`;
     formatted += `   📅 Fecha: ${record.fecha || 'Sin fecha'}\n\n`;
   });
   
@@ -925,17 +924,20 @@ async function startRecordModificationProcess(jid, record) {
       return;
     }
     
-    // Usar el flujo existente de confirmación/modificación
+    // Obtener el primer elemento del array ya que la función retorna un array
+    const recordData = Array.isArray(singleRecord) ? singleRecord[0] : singleRecord;
+    
+    // Usar el flujo existente de confirmación/modificación con nombres consistentes
     const structuredData = {
-      nombre: singleRecord.destinatario_name,
-      monto: singleRecord.monto,
-      fecha: singleRecord.fecha,
-      hora: singleRecord.hora,
-      tipo_movimiento: singleRecord.tipo_movimiento,
-      medio_pago: singleRecord.medio_pago,
-      cuenta_contable: singleRecord.cuenta_owner_name,
-      cuenta: singleRecord.cuenta_description || null,
-      recordId: singleRecord.id // Agregar ID para identificar que es una modificación
+      nombre: recordData.destinatario_nombre,
+      monto: recordData.monto,
+      fecha: recordData.fecha,
+      hora: recordData.hora,
+      tipo_movimiento: recordData.tipo_movimiento,
+      medio_pago: recordData.metodo_pago_nombre,
+      dueno_nombre: recordData.dueno_nombre,
+      cuenta_contable_descripcion: recordData.cuenta_contable_descripcion,
+      recordId: recordData.id // Agregar ID para identificar que es una modificación
     };
     
     // Mostrar datos actuales usando la función existente
@@ -959,13 +961,12 @@ async function startRecordModificationProcess(jid, record) {
 async function confirmRecordDeletion(jid, record, listData) {
   const monto = cleanAmount(record.monto);
   const montoStr = (typeof monto === 'number') ? `$${monto}` : `$${monto}`;
-  const cuentaDescription = record.cuentaContableName || 'Sin descripción';
   
   const confirmationMessage = `🗑️ *¿Confirmas eliminar este registro?*\n\n` +
-    `👤 *Destinatario:* ${record.destinatarioName || 'Sin destinatario'}\n` +
+    `👤 *Destinatario:* ${record.destinatario_nombre || 'Sin destinatario'}\n` +
     `💰 *Monto:* ${montoStr}\n` +
     `📊 *Tipo:* ${record.tipo_movimiento || 'No especificado'}\n` +
-    `🏦 *Cuenta:* ${cuentaDescription}\n` +
+    `🏦 *Cuenta:* ${record.cuenta_contable_descripcion || 'Sin descripción'}\n` +
     `📅 *Fecha:* ${record.fecha || 'Sin fecha'}\n\n` +
     `1. ✅ Sí, eliminar\n` +
     `2. ❌ No, cancelar\n\n` +
@@ -4045,8 +4046,7 @@ const saveComprobante = async (jid, userData) => {
     if (isModification) {
       const { recordId, ...updateData } = normalized;
 
-      const modifying = await updatingDataFlow(updateData)
-      result = modifying;
+      result = await updatingDataFlow(updateData, recordId);
       
     } else {
       // Crear nuevo registro
