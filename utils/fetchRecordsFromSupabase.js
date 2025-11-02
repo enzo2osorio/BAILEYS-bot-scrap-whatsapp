@@ -44,8 +44,10 @@ async function fetchRecordsWithAllStuff(startDate, endDate, offset = 0, limit = 
 
     const formatedRecords = records.map(record => ({
       ...record,
-      fecha: record.fecha?.toISOString().split('T')[0] || null
-    }));
+      fecha: record.fecha
+        ? new Date(record.fecha).toISOString().split('T')[0]
+        : null
+}));
 
     const registrosWDestinatarios = await Promise.all(formatedRecords.map(async (registro) => {
         const { data: destinatario } = await supabase.from('destinatarios')
