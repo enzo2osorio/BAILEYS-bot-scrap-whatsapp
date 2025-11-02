@@ -49,12 +49,22 @@ async function updatingDataFlow(updateData, recordId) {
     const newMetodoPagoId = await getMetodoPagoIdByName(updateData.medio_pago);
     const newCuentaContableId = await getCuentaContableIdByName(updateData.cuenta_contable_descripcion);    
 
+    // Validar que los IDs requeridos existan
+    if (!newDestinatarioId) {
+        return { success: false, message: 'Error: Destinatario no encontrado', error: null };
+    }
+    if (!newMetodoPagoId) {
+        return { success: false, message: 'Error: Método de pago no encontrado', error: null };
+    }
+    if (!newCuentaContableId) {
+        return { success: false, message: 'Error: Cuenta contable no encontrada', error: null };
+    }
+
     const { data, error } = await supabase
         .from('registros')
         .update({
             destinatario_id: newDestinatarioId,
             monto: updateData.monto,
-            fecha: updateData.fecha_iso || updateData.fecha,
             tipo_movimiento: updateData.tipo_movimiento,
             metodo_pago_id: newMetodoPagoId,
             cuenta_contable_id: newCuentaContableId,

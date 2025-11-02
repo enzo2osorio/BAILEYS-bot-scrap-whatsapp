@@ -511,11 +511,6 @@ async function handleCreateCuentaOwnerSelectionDynamic(jid, textMessage, userSta
   await showMetodosPagoForCuentaLink(jid, updated);
 }
 
-// 📋 ===============================
-// SISTEMA DE LISTADO DE REGISTROS
-// ===============================
-
-// 🗓️ Función para parsear fecha dd/mm/yyyy
 function parseListDate(dateStr) {
   if (!dateStr || typeof dateStr !== 'string') return null;
   
@@ -536,7 +531,6 @@ function parseListDate(dateStr) {
   
   const date = new Date(yearNum, monthNum - 1, dayNum);
   
-  // Verificar que la fecha sea válida
   if (date.getDate() !== dayNum || date.getMonth() !== monthNum - 1 || date.getFullYear() !== yearNum) {
     return null;
   }
@@ -676,7 +670,7 @@ async function handleListStartDate(jid, textMessage, userState) {
     }
   }
   
-  // Parsear fecha manual
+  
   const startDate = parseListDate(input);
   
   if (!startDate) {
@@ -686,14 +680,12 @@ async function handleListStartDate(jid, textMessage, userState) {
     return;
   }
   
-  // Solicitar fecha de fin
   setUserState(jid, STATES.AWAITING_LIST_END_DATE, { startDate });
   await safeSendMessage(jid, { 
     text: '📅 Ahora escribe la fecha de fin en formato dd/mm/yyyy:' 
   });
 }
 
-// 📝 Manejar selección de fecha de fin
 async function handleListEndDate(jid, textMessage, userState) {
   const input = textMessage.trim();
   const startDate = userState?.data?.startDate;
@@ -724,7 +716,6 @@ async function handleListEndDate(jid, textMessage, userState) {
   await processDateRangeAndShowRecords(jid, startDate, endDate);
 }
 
-// 🔄 Procesar rango de fechas y mostrar registros
 async function processDateRangeAndShowRecords(jid, startDate, endDate, offset = 0) {
   try {
     await safeSendMessage(jid, { text: '🔍 Buscando registros...' });
@@ -772,7 +763,9 @@ async function processDateRangeAndShowRecords(jid, startDate, endDate, offset = 
       offset,
       hasMore,
       totalCount,
-      startIndex
+      startIndex,
+      // Inicializar allRecords como null - se cargará cuando sea necesario
+      allRecords: null
     });
     
     await safeSendMessage(jid, { text: fullMessage });
@@ -783,6 +776,37 @@ async function processDateRangeAndShowRecords(jid, startDate, endDate, offset = 
     await safeSendMessage(jid, { 
       text: '❌ Error al buscar registros. Inténtalo de nuevo más tarde.' 
     });
+  }
+}
+
+// 🔄 Función para cargar todos los registros cuando sea necesario (para modificar/eliminar)
+async function loadAllRecordsIfNeeded(jid, userState) {
+  const { startDate, endDate, allRecords } = userState?.data || {};
+  
+  // Si ya tenemos todos los registros cargados, no hacer nada
+  if (allRecords && allRecords.length > 0) {
+    return allRecords;
+  }
+  
+  // Cargar todos los registros sin límite
+  try {
+    await safeSendMessage(jid, { text: '🔍 Cargando todos los registros...' });
+    
+    const result = await fetchRecordsWithAllStuff(startDate, endDate, 0, 10000); // Límite muy alto
+    const { records: allLoadedRecords } = result;
+    
+    // Actualizar el estado con todos los registros
+    const currentData = userState.data;
+    setUserState(jid, userState.state, {
+      ...currentData,
+      allRecords: allLoadedRecords
+    });
+    
+    return allLoadedRecords;
+  } catch (error) {
+    console.error('❌ Error cargando todos los registros:', error);
+    await safeSendMessage(jid, { text: '❌ Error al cargar todos los registros.' });
+    return [];
   }
 }
 
@@ -847,57 +871,69 @@ async function handleListActionSelection(jid, textMessage, userState) {
 
 // ✏️ Iniciar modificación de registro
 async function startRecordModification(jid, listData) {
-  const { records, startIndex } = listData;
-  const maxIndex = startIndex + records.length - 1;
+  // Cargar todos los registros si no están cargados
+  const userState = getUserState(jid);
+  const allRecords = await loadAllRecordsIfNeeded(jid, userState);
+  
+  if (allRecords.length === 0) {
+    await safeSendMessage(jid, { text: '❌ Error al cargar los registros.' });
+    return;
+  }
   
   setUserState(jid, STATES.AWAITING_LIST_RECORD_INDEX, {
     ...listData,
+    allRecords,
     action: 'modify'
   });
   
   await safeSendMessage(jid, { 
-    text: `✏️ Escribe el número del registro a modificar (${startIndex}-${maxIndex}):` 
+    text: `✏️ Escribe el número del registro a modificar (1-${allRecords.length}):\n\n💡 Puedes seleccionar cualquier registro de todas las páginas.` 
   });
 }
 
 // 🗑️ Iniciar eliminación de registro
 async function startRecordDeletion(jid, listData) {
-  const { records, startIndex } = listData;
-  const maxIndex = startIndex + records.length - 1;
+  // Cargar todos los registros si no están cargados
+  const userState = getUserState(jid);
+  const allRecords = await loadAllRecordsIfNeeded(jid, userState);
+  
+  if (allRecords.length === 0) {
+    await safeSendMessage(jid, { text: '❌ Error al cargar los registros.' });
+    return;
+  }
   
   setUserState(jid, STATES.AWAITING_LIST_RECORD_INDEX, {
     ...listData,
+    allRecords,
     action: 'delete'
   });
   
   await safeSendMessage(jid, { 
-    text: `🗑️ Escribe el número del registro a eliminar (${startIndex}-${maxIndex}):` 
+    text: `🗑️ Escribe el número del registro a eliminar (1-${allRecords.length}):\n\n💡 Puedes seleccionar cualquier registro de todas las páginas.` 
   });
 }
 
 // 🔢 Manejar selección de índice de registro
 async function handleListRecordIndex(jid, textMessage, userState) {
   const index = parseInt(textMessage.trim(), 10);
-  const { records, startIndex, action } = userState?.data || {};
+  const { allRecords, action } = userState?.data || {};
   
-  if (!records || !action) {
+  if (!allRecords || !action) {
     clearUserState(jid);
     await safeSendMessage(jid, { text: '❌ Error: No se encontraron datos. Reinicia el listado.' });
     return;
   }
   
-  const maxIndex = startIndex + records.length - 1;
-  
-  if (isNaN(index) || index < startIndex || index > maxIndex) {
+  // Validar con todos los registros (índice global)
+  if (isNaN(index) || index < 1 || index > allRecords.length) {
     await safeSendMessage(jid, { 
-      text: `❌ Número inválido. Escribe un número entre ${startIndex} y ${maxIndex}.` 
+      text: `❌ Número inválido. Escribe un número entre 1 y ${allRecords.length}.` 
     });
     return;
   }
   
-  // Encontrar el registro correspondiente
-  const recordArrayIndex = index - startIndex;
-  const selectedRecord = records[recordArrayIndex];
+  // Encontrar el registro correspondiente (índice basado en 1)
+  const selectedRecord = allRecords[index - 1];
   
   if (!selectedRecord) {
     await safeSendMessage(jid, { text: '❌ Error: No se encontró el registro seleccionado.' });
@@ -4238,7 +4274,6 @@ const showModificationMenu = async (jid, userData) => {
     await proceedToFinalConfirmationFromModification(jid, updatedData);
   };
 
-  // 📅 Manejar modificación de fecha
   const handleFechaModification = async (jid, textMessage, userState, quotedMsg) => {
     const input = textMessage.trim();
     
@@ -4254,7 +4289,6 @@ const showModificationMenu = async (jid, userData) => {
       return;
     }
 
-    // Actualizar fecha en los datos
     const updatedData = {
       ...userState.data.finalStructuredData,
       fecha: input
