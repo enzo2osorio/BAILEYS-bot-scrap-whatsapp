@@ -42,7 +42,12 @@ async function fetchRecordsWithAllStuff(startDate, endDate, offset = 0, limit = 
       return { records: [], totalCount: count || 0, hasMore: false };
     }
 
-    const registrosWDestinatarios = await Promise.all(records.map(async (registro) => {
+    const formatedRecords = records.map(record => ({
+      ...record,
+      fecha: record.fecha?.toISOString().split('T')[0] || null
+    }));
+
+    const registrosWDestinatarios = await Promise.all(formatedRecords.map(async (registro) => {
         const { data: destinatario } = await supabase.from('destinatarios')
           .select('name')
           .eq('id', registro.destinatario_id)
@@ -65,23 +70,28 @@ async function fetchRecordsWithAllStuff(startDate, endDate, offset = 0, limit = 
     }));
 
     const registrosWCuentaContable = await Promise.all(registrosWMetodoPago.map(async(registro) => {
-        const cuentaInfo = await findCuentaLinkByIds(registro.destinatario_id, registro.metodo_pago_id);
+        const {data : cuentaContableInfo} = await supabase.from('metodo_pago_destinatario_duenos')
+          .select('description, destinatario_id')
+          .eq('id', registro.cuenta_contable_id)
+          .maybeSingle();
         
         // Obtener nombre del dueño/destinatario
         const { data: dueno } = await supabase.from('destinatarios')
           .select('name')
-          .eq('id', registro.cuenta_contable_id || registro.destinatario_id)
+          .eq('id', cuentaContableInfo?.destinatario_id)
           .maybeSingle();
         
         return { 
           ...registro, 
-          cuenta_contable_descripcion: cuentaInfo?.description || `${registro.metodo_pago_nombre} de ${dueno?.name || 'Sin dueño'}`,
-          dueno_nombre: dueno?.name || 'Sin dueño'
+          cuenta_contable_descripcion: cuentaContableInfo?.description,
+          dueno_nombre: dueno?.name
         };
     }));
     
     const hasMore = (offset + limit) < (count || 0);
     
+    
+
     return { 
       records: registrosWCuentaContable || [], 
       totalCount: count || 0, 
