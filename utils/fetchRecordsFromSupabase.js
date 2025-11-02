@@ -72,17 +72,25 @@ async function fetchRecordsWithAllStuff(startDate, endDate, offset = 0, limit = 
     }));
 
     const registrosWCuentaContable = await Promise.all(registrosWMetodoPago.map(async(registro) => {
-        const {data : cuentaContableInfo} = await supabase.from('metodo_pago_destinatario_duenos')
+        const {data : cuentaContableInfo, error: errorCuentaContable} = await supabase.from('metodo_pago_destinatario_duenos')
           .select('description, destinatario_id')
           .eq('id', registro.cuenta_contable_id)
           .maybeSingle();
         
+          if (errorCuentaContable) {
+            console.error('❌ Error obteniendo cuenta contable info :', errorCuentaContable);
+          }
+
         // Obtener nombre del dueño/destinatario
-        const { data: dueno } = await supabase.from('destinatarios')
+        const { data: dueno, error } = await supabase.from('destinatarios')
           .select('name')
           .eq('id', cuentaContableInfo?.destinatario_id)
           .maybeSingle();
         
+          if (error) {
+            console.error('❌ Error obteniendo nombre del dueño :', error);
+          }
+
         return { 
           ...registro, 
           cuenta_contable_descripcion: cuentaContableInfo?.description,
@@ -121,7 +129,7 @@ async function fetchRecordWithAllStuffById( recordId) {
       return [];
     }
 
-    const registrosWDestinatarios = await Promise.all([singleRecord].map(async (registro) => {
+    const registroWDestinatario = singleRecord.map(async (registro) => {
         const { data: destinatario } = await supabase.from('destinatarios')
           .select('name')
           .eq('id', registro.destinatario_id)
@@ -130,28 +138,37 @@ async function fetchRecordWithAllStuffById( recordId) {
           ...registro, 
           destinatario_nombre: destinatario?.name || 'Sin destinatario'
         };
-    }));
+    });
 
-    const registrosWCuentaContable = await Promise.all(registrosWDestinatarios.map(async(registro) => {
-        const cuentaContableInfo = await findCuentaLinkByIds(registro.destinatario_id, registro.metodo_pago_id);
-        
-        // Obtener nombre del dueño/destinatario de la cuenta contable
-        const { data: dueno } = await supabase
-          .from('destinatarios')
-          .select('name')
-          .eq('id', cuentaContableInfo?.destinatario_id || registro.destinatario_id)
+    const registroWCuentaContable = registroWDestinatario.map(async (registro) => {
+
+      const {data: cuentaContableInfo, error: errorCuentaContable} = await supabase.from('metodo_pago_destinatario_duenos')
+          .select('description, destinatario_id')
+          .eq('id', registro.cuenta_contable_id)
           .maybeSingle();
-        
+
+          if (errorCuentaContable) {
+            console.error('❌ Error obteniendo cuenta contable info :', errorCuentaContable);
+          }
+
+        // Obtener nombre del dueño/destinatario
+        const { data: dueno, error } = await supabase.from('destinatarios')
+          .select('name')
+          .eq('id', cuentaContableInfo?.destinatario_id)
+          .maybeSingle();
+
+          if (error) {
+            console.error('❌ Error obteniendo nombre del dueño :', error);
+          }
         return { 
           ...registro, 
-          cuenta_contable_descripcion: cuentaContableInfo?.description || null, 
-          dueno_nombre: dueno?.name || null 
+          cuenta_contable_descripcion: cuentaContableInfo?.description,
+          dueno_nombre: dueno?.name
         };
-    }));
+    })
     
-    const registrosWMedioPago = await Promise.all(registrosWCuentaContable.map(async (registro) => {
-        const { data: metodoPago } = await supabase
-          .from('metodos_pago')
+    const registrosWMedioPago = registroWCuentaContable.map(async (registro) => {
+        const { data: metodoPago } = await supabase.from('metodos_pago')
           .select('name')
           .eq('id', registro.metodo_pago_id)
           .maybeSingle();
@@ -159,7 +176,7 @@ async function fetchRecordWithAllStuffById( recordId) {
           ...registro, 
           metodo_pago_nombre: metodoPago?.name || null 
         };
-    }));
+    });
 
     return registrosWMedioPago;
     
