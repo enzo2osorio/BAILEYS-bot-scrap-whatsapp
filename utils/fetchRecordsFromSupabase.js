@@ -4,11 +4,23 @@ const { findCuentaLinkByIds } = require("./destinatarios/resolveCuentaContableDe
 
 async function fetchRecordsWithAllStuff(startDate, endDate, offset = 0, limit = 50) {
   try {
-    // Convertir fechas a formato ISO para Supabase
-    const startISO = startDate.toISOString().split('T')[0];
-    const endISO = endDate.toISOString().split('T')[0];
+    // Expandir rango de fechas para incluir registros con hora 00:00:00
+    // Fecha inicio: empezar desde 23:59:50 del día anterior
+    const expandedStartDate = new Date(startDate);
+    expandedStartDate.setDate(expandedStartDate.getDate() - 1);
+    expandedStartDate.setHours(23, 59, 50, 0); // 10 segundos antes del día
     
-    // Contar total de registros en el rango
+    // Fecha fin: terminar a las 23:59:59 del día especificado
+    const expandedEndDate = new Date(endDate);
+    expandedEndDate.setHours(23, 59, 59, 999); // Final del día
+    
+    // Convertir a formato ISO para Supabase
+    const startISO = expandedStartDate.toISOString();
+    const endISO = expandedEndDate.toISOString();
+    
+    console.log(`🔍 Buscando registros entre: ${startISO} y ${endISO}`);
+    
+    // Contar total de registros en el rango expandido
     const { count, error: countError } = await supabase
       .from('registros')
       .select('*', { count: 'exact', head: true })
@@ -45,7 +57,11 @@ async function fetchRecordsWithAllStuff(startDate, endDate, offset = 0, limit = 
     const formatedRecords = records.map(record => ({
       ...record,
       fecha: record.fecha
-        ? new Date(record.fecha).toISOString().split('T')[0]
+        ? new Date(record.fecha).toLocaleDateString('es-ES', {
+            day: '2-digit',
+            month: '2-digit', 
+            year: 'numeric'
+          }).replace(/\//g, '/')
         : null
 }));
 
@@ -114,7 +130,7 @@ async function fetchRecordsWithAllStuff(startDate, endDate, offset = 0, limit = 
   }
 }
 
-async function fetchRecordWithAllStuffById( recordId) {
+async function fetchRecordWithAllStuffById(recordId) {
   try {
     
     const { data: singleRecord, error } = await supabase
@@ -123,66 +139,60 @@ async function fetchRecordWithAllStuffById( recordId) {
       .eq('id', recordId)
       .single();
 
-
     if (error) {
       console.error('❌ Error obteniendo registro por ID:', error);
-      return [];
+      return null;
     }
 
-    const registroWDestinatario = singleRecord.map(async (registro) => {
-        const { data: destinatario } = await supabase.from('destinatarios')
-          .select('name')
-          .eq('id', registro.destinatario_id)
-          .maybeSingle();
-        return { 
-          ...registro, 
-          destinatario_nombre: destinatario?.name || 'Sin destinatario'
-        };
-    });
+    if (!singleRecord) {
+      console.log('❌ No se encontró el registro con ID:', recordId);
+      return null;
+    }
 
-    const registroWCuentaContable = registroWDestinatario.map(async (registro) => {
+    // Obtener destinatario
+    const { data: destinatario } = await supabase.from('destinatarios')
+      .select('name')
+      .eq('id', singleRecord.destinatario_id)
+      .maybeSingle();
 
-      const {data: cuentaContableInfo, error: errorCuentaContable} = await supabase.from('metodo_pago_destinatario_duenos')
-          .select('description, destinatario_id')
-          .eq('id', registro.cuenta_contable_id)
-          .maybeSingle();
+    // Obtener información de cuenta contable
+    const { data: cuentaContableInfo, error: errorCuentaContable } = await supabase.from('metodo_pago_destinatario_duenos')
+      .select('description, destinatario_id')
+      .eq('id', singleRecord.cuenta_contable_id)
+      .maybeSingle();
 
-          if (errorCuentaContable) {
-            console.error('❌ Error obteniendo cuenta contable info :', errorCuentaContable);
-          }
+    if (errorCuentaContable) {
+      console.error('❌ Error obteniendo cuenta contable info:', errorCuentaContable);
+    }
 
-        // Obtener nombre del dueño/destinatario
-        const { data: dueno, error } = await supabase.from('destinatarios')
-          .select('name')
-          .eq('id', cuentaContableInfo?.destinatario_id)
-          .maybeSingle();
+    // Obtener nombre del dueño/destinatario
+    const { data: dueno, error: errorDueno } = await supabase.from('destinatarios')
+      .select('name')
+      .eq('id', cuentaContableInfo?.destinatario_id)
+      .maybeSingle();
 
-          if (error) {
-            console.error('❌ Error obteniendo nombre del dueño :', error);
-          }
-        return { 
-          ...registro, 
-          cuenta_contable_descripcion: cuentaContableInfo?.description,
-          dueno_nombre: dueno?.name
-        };
-    })
-    
-    const registrosWMedioPago = registroWCuentaContable.map(async (registro) => {
-        const { data: metodoPago } = await supabase.from('metodos_pago')
-          .select('name')
-          .eq('id', registro.metodo_pago_id)
-          .maybeSingle();
-        return { 
-          ...registro, 
-          metodo_pago_nombre: metodoPago?.name || null 
-        };
-    });
+    if (errorDueno) {
+      console.error('❌ Error obteniendo nombre del dueño:', errorDueno);
+    }
 
-    return registrosWMedioPago;
+    // Obtener método de pago
+    const { data: metodoPago } = await supabase.from('metodos_pago')
+      .select('name')
+      .eq('id', singleRecord.metodo_pago_id)
+      .maybeSingle();
+
+    // Retornar objeto único completo
+    return {
+      ...singleRecord,
+      destinatario_nombre: destinatario?.name || 'Sin destinatario',
+      cuenta_contable_descripcion: cuentaContableInfo?.description || null,
+      dueno_nombre: dueno?.name || null,
+      metodo_pago_nombre: metodoPago?.name || 'Sin método de pago'
+    };
     
   } catch (error) {
-    console.error('❌ Error en fetchRecordsWithAllStuff:', error);
-    return [];
+    console.error('❌ Error en fetchRecordWithAllStuffById:', error);
+    return null;
   }
 }
 
