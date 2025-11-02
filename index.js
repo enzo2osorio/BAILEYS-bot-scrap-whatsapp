@@ -325,6 +325,13 @@ function formatFinalConfirmation(data, updated = false) {
   const montoVal = cleanAmount(data.monto);
   const montoStr = (typeof montoVal === 'number') ? `$${montoVal}` : (String(montoVal).startsWith('$') ? montoVal : `$${montoVal}`);
   
+  // Formatear fecha: si viene en formato ISO, convertir a dd/mm/yyyy
+  let fechaDisplay = data.fecha || 'No especificada';
+  if (fechaDisplay && fechaDisplay.includes('T')) {
+    // Si es formato ISO (contiene T), convertir
+    fechaDisplay = formatISOToUserDate(fechaDisplay) || fechaDisplay;
+  }
+  
   // Usar nombres consistentes: dueno_nombre y cuenta_contable_descripcion
   const duenoNombre = data.dueno_nombre || data.cuenta_contable || 'No especificado';
   const cuentaDescripcion = data.cuenta_contable_descripcion || 
@@ -333,7 +340,7 @@ function formatFinalConfirmation(data, updated = false) {
   return `📋 *Datos del comprobante ${updated ? " (actualizados)" : ""}:*\n\n` +
     `👤 *Destinatario:* ${data.nombre || 'No especificado'}\n` +
     `💰 *Monto:* ${montoStr}\n` +
-    `📅 *Fecha:* ${data.fecha || 'No especificada'}\n` +
+    `📅 *Fecha:* ${fechaDisplay}\n` +
     `📊 *Tipo:* ${data.tipo_movimiento || 'No especificado'}\n` +
     `💳 *Método de pago:* ${data.medio_pago || 'No especificado'}\n` +
     `👤 *Dueño de cuenta:* ${duenoNombre}\n` +
@@ -948,6 +955,21 @@ async function handleListRecordIndex(jid, textMessage, userState) {
 }
 
 // ✏️ Iniciar proceso de modificación de registro específico
+// Función auxiliar para convertir fecha ISO a formato dd/mm/yyyy
+function formatISOToUserDate(isoString) {
+  if (!isoString) return null;
+  try {
+    const date = new Date(isoString);
+    const day = date.getDate().toString().padStart(2, '0');
+    const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const year = date.getFullYear();
+    return `${day}/${month}/${year}`;
+  } catch (error) {
+    console.error('Error al formatear fecha ISO:', error);
+    return null;
+  }
+}
+
 async function startRecordModificationProcess(jid, record) {
   try {
     // Obtener datos completos del registro desde Supabase
@@ -963,11 +985,15 @@ async function startRecordModificationProcess(jid, record) {
     // Obtener el primer elemento del array ya que la función retorna un array
     const recordData = Array.isArray(singleRecord) ? singleRecord[0] : singleRecord;
     
+    // Convertir fecha ISO a formato usuario antes de usar
+    const formattedDate = formatISOToUserDate(recordData.fecha);
+    
     // Usar el flujo existente de confirmación/modificación con nombres consistentes
     const structuredData = {
       nombre: recordData.destinatario_nombre,
       monto: recordData.monto,
-      fecha: recordData.fecha,
+      fecha: formattedDate, // Usar fecha formateada para display
+      fecha_iso: recordData.fecha, // Preservar fecha original ISO
       hora: recordData.hora,
       tipo_movimiento: recordData.tipo_movimiento,
       medio_pago: recordData.metodo_pago_nombre,
@@ -1570,13 +1596,15 @@ async function ensureSingleInstanceLock() {
 }
 
 
-// Liberar lock al salir
-for (const sig of ['SIGINT','SIGTERM','SIGHUP','SIGBREAK']) {
+// Liberar lock al salir - EXCLUYENDO SIGTERM que se maneja por separado
+for (const sig of ['SIGINT','SIGHUP','SIGBREAK']) {
   process.on(sig, async () => {
+    console.log(`🔄 ${sig} recibido - liberando lock y cerrando...`);
     try { await instanceLockRelease?.(); } catch (_) {}
     process.exit(0);
   });
 }
+// NOTA: SIGTERM se maneja en el handler 'graceful' más abajo para ignorarlo
 
 async function getAuthStateWithRetry() {
   const max = 5;
@@ -1715,6 +1743,7 @@ async function recoverFrom428() {
 
     await reconnectMongo();
     await ensureSingleInstanceLock();
+    console.log('🔒 Lock de instancia readquirido tras recuperación 428');
 
     // Marcar reanudación pendiente
     global.pending428Resume = true;
@@ -2098,39 +2127,22 @@ const P = require("pino")({
 
 //PARTE - RESISTENCIA A SIGTERM MEJORADA
 const graceful = async (signal) => {
-  console.log(`\n🔄 ${signal} recibido. Aplicando estrategia de persistencia...`);
+  console.log(`\n�️ ${signal} recibido.`);
   
   if (signal === 'SIGTERM') {
-    // SIGTERM desde Render - NO cerrar Mongo, solo pausar operaciones
-    console.log('🛡️ SIGTERM detectado: pausando operaciones pero manteniendo conexiones');
+    // IGNORAR SIGTERM COMPLETAMENTE - Render lo envía tras 428 pero no es necesario actuar
+    console.log('� SIGTERM ignorado - El bot continuará operando normalmente');
+    console.log('💡 Razón: SIGTERM en Render suele ser preventivo tras errores 428');
+    console.log('🔄 El bot tiene auto-recovery robusto y no necesita pausas manuales');
     
-    try {
-      // Pausar WhatsApp pero mantener Mongo vivo
-      await stopBaileysGracefully();
-      console.log('⏸️ WhatsApp pausado - Mongo permanece activo');
-      
-      // Programar auto-recuperación en 30 segundos
-      setTimeout(async () => {
-        console.log('🔄 Auto-recuperación iniciada tras SIGTERM...');
-        try {
-          await connectToWhatsApp();
-          console.log('✅ Bot recuperado exitosamente');
-        } catch (e) {
-          console.log('❌ Falló auto-recuperación, reintentando en 60s...', e.message);
-          setTimeout(() => process.exit(1), 60000); // Si todo falla, exit controlado
-        }
-      }, 30000);
-      
-      // NO hacer process.exit - dejar que Render decida
-      return;
-    } catch (e) {
-      console.log('❌ Error en manejo SIGTERM:', e.message);
-    }
+    // NO hacer nada - mantener todo funcionando
+    return;
   }
   
   // Para SIGINT (Ctrl+C) sí cerrar todo correctamente
   if (signal === 'SIGINT') {
-    console.log('🔄 SIGINT recibido. Cerrando conexiones Mongo...');
+    console.log('🔄 SIGINT recibido. Cerrando conexiones...');
+    try { await instanceLockRelease?.(); } catch (_) {}
     await closeClient().catch(()=>{});
     process.exit(0);
   }

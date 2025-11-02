@@ -4,6 +4,7 @@
     // data.fecha: dd/mm/yyyy (opcional)
     // data.hora:  HH:mm       (opcional)
     const now = new Date();
+    const isModification = !!data.recordId; // Si tiene recordId es una modificación
 
     // Parse fecha dd/mm/yyyy o dd-mm-yyyy
     let d, m, y;
@@ -15,11 +16,28 @@
         y = parseInt(fm[3], 10);
       }
     }
+    
+    // CRÍTICO: Si es modificación y no se pudo parsear la fecha, intentar preservar la original
     if (d == null || m == null || y == null) {
-      // si no hay fecha, usar hoy
-      d = now.getDate();
-      m = now.getMonth() + 1;
-      y = now.getFullYear();
+      if (isModification && data.fecha_iso) {
+        // Si es modificación y tiene fecha ISO original, preservarla
+        try {
+          const originalDate = new Date(data.fecha_iso);
+          d = originalDate.getDate();
+          m = originalDate.getMonth() + 1;
+          y = originalDate.getFullYear();
+        } catch (error) {
+          console.warn('Error preservando fecha original, usando fecha actual');
+          d = now.getDate();
+          m = now.getMonth() + 1;
+          y = now.getFullYear();
+        }
+      } else {
+        // si no hay fecha y no es modificación, usar hoy
+        d = now.getDate();
+        m = now.getMonth() + 1;
+        y = now.getFullYear();
+      }
     }
 
     // Parse hora HH:mm (si no hay, usar 00:00)
