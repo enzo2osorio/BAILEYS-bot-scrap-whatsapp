@@ -49,9 +49,13 @@ const { saveNewCategory, saveNewSubcategory } = require("./utils/saveNewCategory
 const { listCuentaLinksWithNames, getOwnersDueños } = require("./utils/getOwnersDuenos.js");
 const { normalizeDateTime } = require("./utils/normalizeDateTime.js");
 const {  updatingDataFlow } = require("./updateDataFlow.js");
+const ResourceMonitor = require('./utils/resourceMonitor');
 
 
 dotenv.config();
+
+// 📊 Crear instancia global del monitor de recursos
+const resourceMonitor = new ResourceMonitor();
 
 const INACTIVITY_TIMEOUT_MS = parseInt(process.env.INACTIVITY_TIMEOUT_MS || '180000', 10);
 const ALLOWED_JIDS = (process.env.ALLOWED_JIDS || process.env.ALLOWED_GROUP_JIDS || '')
@@ -1230,6 +1234,23 @@ app.get("/health", (req, res) => {
   res.status(200).json(healthStatus);
 });
 
+// 📊 Endpoint de métricas de recursos
+app.get('/metrics', (req, res) => {
+  try {
+    const report = resourceMonitor.generateReport();
+    res.json({
+      success: true,
+      data: report
+    });
+  } catch (error) {
+    console.error('❌ Error generando métricas:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error generando métricas'
+    });
+  }
+});
+
 app.get("/", (req, res) => {
   console.log("Server is running again");
   res.send("server working");
@@ -1725,6 +1746,8 @@ async function reconnectMongo() {
 }
 
 async function recoverFrom428() {
+  resourceMonitor.incrementError('428'); // 📊 Registrar error 428
+  
   if (is428RecoveryInProgress) { console.log('⏳ Recuperación 428 ya en progreso; ignorando llamada duplicada'); return; }
   is428RecoveryInProgress = true;
     messageFreezeUntil = Date.now() + 2000; // congelar recepción inmediata
@@ -2047,6 +2070,7 @@ let lastMacErrorReset = Date.now();
 const handleDecryptionError = (error, jid) => {
   if (error.message?.includes("Bad MAC")) {
     macErrorCount++;
+    resourceMonitor.incrementError('mac');
     
     // Reset contador cada 5 minutos
     if (Date.now() - lastMacErrorReset > 300000) {
@@ -2700,6 +2724,7 @@ const msgRetryCounterCache = new NodeCache();
        case 440:
   console.log("🔄 Error 440: Conflict - Otra instancia activa detectada");
   console.log("⚠️ NO limpiando sesión - solo esperando a que la otra instancia se desconecte");
+  resourceMonitor.incrementError('conflict');
   shouldCleanSession = false;
   shouldReconnect = true;
   reconnectDelay = 30000;
@@ -5016,7 +5041,35 @@ const startApp = async () => {
   }
 };
 
-['SIGINT','SIGTERM'].forEach(sig => process.on(sig, () => graceful(sig)));
+['SIGINT','SIGTERM'].forEach(sig => process.on(sig, () => {
+  resourceMonitor.incrementError('sigterm'); 
+  graceful(sig);
+}));
+
+// 🔥 Iniciar monitoreo de recursos automático
+setTimeout(() => {
+  console.log('🚀 Iniciando monitoreo de recursos...');
+  
+  // Monitoreo cada minuto
+  setInterval(() => {
+    resourceMonitor.logMetrics();
+  }, 60000);
+  
+  // Verificación de alertas cada 30 segundos
+  setInterval(() => {
+    resourceMonitor.checkAlerts();
+  }, 30000);
+  
+  // Garbage collection cada 10 minutos si está disponible
+  if (global.gc) {
+    setInterval(() => {
+      resourceMonitor.forceGarbageCollection();
+    }, 600000);
+  } else {
+    console.log('⚠️ Garbage collection manual no disponible. Usa --expose-gc para habilitarla');
+  }
+  
+}, 5000); // Esperar 5 segundos después del inicio
 
 process.on('uncaughtException', async (err) => { console.error(err); await closeClient(); process.exit(1); });
 process.on('unhandledRejection', async (err) => { console.error(err); await closeClient(); process.exit(1); });

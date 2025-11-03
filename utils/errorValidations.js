@@ -81,8 +81,9 @@ async function validateFinalData(fd) {
     issues.push({ code: 'INVALID_MEDIO_PAGO', field: 'medio_pago', message: 'El método de pago falta o no es válido.' });
   }
 
-  // Cuenta contable
-  if (!fd?.cuenta_contable) {
+  // Cuenta contable (soporta tanto cuenta_contable como cuenta_contable_descripcion)
+  const tieneCuentaContable = fd?.cuenta_contable || fd?.cuenta_contable_descripcion;
+  if (!tieneCuentaContable) {
     issues.push({ code: 'MISSING_CUENTA_CONTABLE', field: 'cuenta_contable', message: 'Cuenta contable no establecida.' });
   }
 

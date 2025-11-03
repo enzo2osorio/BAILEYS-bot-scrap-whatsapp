@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: baileys-whatsapp-bot
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    
+    # 💾 Configuración de almacenamiento persistente
+    disk:
+      name: baileys-disk
+      mountPath: /opt/render/project/src
+      sizeGB: 1
+    
+    # 🔧 Variables de entorno optimizadas
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=1024 --optimize-for-size"
+      - key: UV_THREADPOOL_SIZE
+        value: "16"
+    
+    # 📊 Configuración de escalado
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+    
+    # 🛡️ Configuraciones anti-SIGTERM agresivas
+    httpTimeout: 3600  # 1 hora
+    idleTimeout: 3600  # 1 hora sin actividad
+    
+    # 🩺 Health check muy tolerante
+    healthCheckPath: /health
+    healthCheckGracePeriodSeconds: 600  # 10 minutos de gracia
+    healthCheckIntervalSeconds: 60     # Check cada minuto
+    healthCheckTimeoutSeconds: 30      # 30s timeout por check
+    
+    # 🔄 Configuración de auto-deploy y reinicio
+    autoDeploy: true
+    autoRestart: true
+    
+    # 🚨 Configuraciones experimentales para reducir SIGTERM
+    region: oregon  # Región más estable
+    rootDir: ./     # Directorio raíz explícito
