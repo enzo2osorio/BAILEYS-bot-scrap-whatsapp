@@ -5050,20 +5050,43 @@ const startApp = async () => {
 setTimeout(() => {
   console.log('🚀 Iniciando monitoreo de recursos...');
   
-  // Monitoreo cada minuto
+  // Monitoreo cada minuto con fallback
   setInterval(() => {
-    resourceMonitor.logMetrics();
+    try {
+      resourceMonitor.logMetrics();
+    } catch (error) {
+      console.error('❌ Error en logMetrics:', error.message);
+      console.log(`📊 Fallback - Uptime: ${(process.uptime()/3600).toFixed(1)}h | Heap: ${(process.memoryUsage().heapUsed/1024/1024).toFixed(1)}MB`);
+    }
   }, 60000);
   
-  // Verificación de alertas cada 30 segundos
+  // Verificación de alertas cada 30 segundos con fallback
   setInterval(() => {
-    resourceMonitor.checkAlerts();
+    try {
+      resourceMonitor.checkAlerts();
+    } catch (error) {
+      console.error('❌ Error en checkAlerts:', error.message);
+      // Fallback básico: solo log de memoria si está alta
+      const heapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+      if (heapMB > 200) {
+        console.warn(`⚠️ Memoria heap alta: ${heapMB.toFixed(1)}MB`);
+      }
+    }
   }, 30000);
   
   // Garbage collection cada 10 minutos si está disponible
   if (global.gc) {
     setInterval(() => {
-      resourceMonitor.forceGarbageCollection();
+      try {
+        resourceMonitor.forceGarbageCollection();
+      } catch (error) {
+        console.error('❌ Error en GC:', error.message);
+        // Fallback: GC directo
+        if (global.gc) {
+          console.log('🧹 Ejecutando GC directo...');
+          global.gc();
+        }
+      }
     }, 600000);
   } else {
     console.log('⚠️ Garbage collection manual no disponible. Usa --expose-gc para habilitarla');

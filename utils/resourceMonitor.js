@@ -34,39 +34,40 @@ class ResourceMonitor {
 
   // 📊 Obtener métricas completas del sistema
   getMetrics() {
-    const memUsage = process.memoryUsage();
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-    const usedMem = totalMem - freeMem;
-    
-    // CPU Load (promedio 1 minuto)
-    const loadAvg = os.loadavg();
-    const cpuPercent = Math.min(100, (loadAvg[0] / os.cpus().length) * 100);
+    try {
+      const memUsage = process.memoryUsage();
+      const totalMem = os.totalmem();
+      const freeMem = os.freemem();
+      const usedMem = totalMem - freeMem;
+      
+      // CPU Load (promedio 1 minuto)
+      const loadAvg = os.loadavg();
+      const cpuPercent = Math.min(100, (loadAvg[0] / os.cpus().length) * 100);
     
     const metrics = {
       timestamp: new Date().toISOString(),
-      uptime: process.uptime(),
+      uptime: process.uptime() || 0,
       
       // Memoria del proceso Node.js
       heap: {
-        used: memUsage.heapUsed,
-        total: memUsage.heapTotal,
-        external: memUsage.external,
+        used: memUsage.heapUsed || 0,
+        total: memUsage.heapTotal || 0,
+        external: memUsage.external || 0,
         arrayBuffers: memUsage.arrayBuffers || 0
       },
       
       // Memoria del sistema
       system: {
-        total: totalMem,
-        used: usedMem,
-        free: freeMem,
-        usagePercent: (usedMem / totalMem) * 100
+        total: totalMem || 0,
+        used: usedMem || 0,
+        free: freeMem || 0,
+        usagePercent: totalMem > 0 ? (usedMem / totalMem) * 100 : 0
       },
       
       // CPU
       cpu: {
-        percent: cpuPercent,
-        loadAverage: loadAvg
+        percent: isNaN(cpuPercent) ? 0 : cpuPercent,
+        loadAverage: loadAvg || [0, 0, 0]
       },
       
       // Contadores de errores
@@ -78,6 +79,21 @@ class ResourceMonitor {
     };
     
     return metrics;
+    
+    } catch (error) {
+      console.error('❌ Error obteniendo métricas:', error);
+      // Devolver métricas por defecto en caso de error
+      return {
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        heap: { used: 0, total: 0, external: 0, arrayBuffers: 0 },
+        system: { total: 0, used: 0, free: 0, usagePercent: 0 },
+        cpu: { percent: 0, loadAverage: [0, 0, 0] },
+        errors: { ...this.errorCounts },
+        handles: 0,
+        requests: 0
+      };
+    }
   }
 
   // 🚨 Verificar si hay alertas necesarias
@@ -88,9 +104,29 @@ class ResourceMonitor {
         metrics = this.getMetrics();
       }
       
-      // Validar que las métricas tienen la estructura esperada
-      if (!metrics || !metrics.heap || !metrics.system || !metrics.cpu) {
-        console.error('❌ Métricas inválidas en checkAlerts:', metrics);
+      // Validación exhaustiva para prevenir errores
+      if (!metrics) {
+        console.warn('⚠️ No se pudieron obtener métricas');
+        return [];
+      }
+      
+      if (!metrics.heap) {
+        console.warn('⚠️ Métricas sin información de heap');
+        return [];
+      }
+      
+      if (typeof metrics.heap.used !== 'number') {
+        console.warn('⚠️ heap.used no es un número válido:', typeof metrics.heap.used);
+        return [];
+      }
+      
+      if (!metrics.system || typeof metrics.system.usagePercent !== 'number') {
+        console.warn('⚠️ Métricas de sistema inválidas');
+        return [];
+      }
+      
+      if (!metrics.cpu || typeof metrics.cpu.percent !== 'number') {
+        console.warn('⚠️ Métricas de CPU inválidas');
         return [];
       }
       
