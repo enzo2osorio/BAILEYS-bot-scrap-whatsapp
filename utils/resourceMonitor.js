@@ -81,9 +81,21 @@ class ResourceMonitor {
   }
 
   // 🚨 Verificar si hay alertas necesarias
-  checkAlerts(metrics) {
-    const alerts = [];
-    const now = Date.now();
+  checkAlerts(metrics = null) {
+    try {
+      // Si no se pasan métricas, obtenerlas
+      if (!metrics) {
+        metrics = this.getMetrics();
+      }
+      
+      // Validar que las métricas tienen la estructura esperada
+      if (!metrics || !metrics.heap || !metrics.system || !metrics.cpu) {
+        console.error('❌ Métricas inválidas en checkAlerts:', metrics);
+        return [];
+      }
+      
+      const alerts = [];
+      const now = Date.now();
     
     // Alerta de memoria heap
     if (metrics.heap.used > this.thresholds.heap.critical) {
@@ -153,6 +165,11 @@ class ResourceMonitor {
     }
     
     return alerts;
+    
+    } catch (error) {
+      console.error('❌ Error en checkAlerts:', error);
+      return [];
+    }
   }
 
   // 📈 Almacenar muestra histórica
