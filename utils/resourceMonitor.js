@@ -12,10 +12,7 @@ class ResourceMonitor {
         warning: 70,  // % de uso de CPU
         critical: 85
       },
-      heap: {
-        warning: 200 * 1024 * 1024, // 200MB
-        critical: 250 * 1024 * 1024  // 250MB
-      }
+
     };
     
     this.alerts = new Map(); // Prevenir spam de alerts
@@ -48,13 +45,7 @@ class ResourceMonitor {
       timestamp: new Date().toISOString(),
       uptime: process.uptime() || 0,
       
-      // Memoria del proceso Node.js
-      heap: {
-        used: memUsage.heapUsed || 0,
-        total: memUsage.heapTotal || 0,
-        external: memUsage.external || 0,
-        arrayBuffers: memUsage.arrayBuffers || 0
-      },
+
       
       // Memoria del sistema
       system: {
@@ -86,7 +77,7 @@ class ResourceMonitor {
       return {
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
-        heap: { used: 0, total: 0, external: 0, arrayBuffers: 0 },
+
         system: { total: 0, used: 0, free: 0, usagePercent: 0 },
         cpu: { percent: 0, loadAverage: [0, 0, 0] },
         errors: { ...this.errorCounts },
@@ -110,15 +101,7 @@ class ResourceMonitor {
         return [];
       }
       
-      if (!metrics.heap) {
-        console.warn('⚠️ Métricas sin información de heap');
-        return [];
-      }
-      
-      if (typeof metrics.heap.used !== 'number') {
-        console.warn('⚠️ heap.used no es un número válido:', typeof metrics.heap.used);
-        return [];
-      }
+
       
       if (!metrics.system || typeof metrics.system.usagePercent !== 'number') {
         console.warn('⚠️ Métricas de sistema inválidas');
@@ -133,30 +116,7 @@ class ResourceMonitor {
       const alerts = [];
       const now = Date.now();
     
-    // Alerta de memoria heap
-    if (metrics.heap.used > this.thresholds.heap.critical) {
-      if (!this.alerts.has('heap-critical') || now - this.alerts.get('heap-critical') > 300000) {
-        alerts.push({
-          level: 'CRITICAL',
-          type: 'HEAP_MEMORY',
-          message: `🔴 Heap crítico: ${(metrics.heap.used / 1024 / 1024).toFixed(1)}MB`,
-          value: metrics.heap.used,
-          threshold: this.thresholds.heap.critical
-        });
-        this.alerts.set('heap-critical', now);
-      }
-    } else if (metrics.heap.used > this.thresholds.heap.warning) {
-      if (!this.alerts.has('heap-warning') || now - this.alerts.get('heap-warning') > 600000) {
-        alerts.push({
-          level: 'WARNING',
-          type: 'HEAP_MEMORY',
-          message: `🟡 Heap elevado: ${(metrics.heap.used / 1024 / 1024).toFixed(1)}MB`,
-          value: metrics.heap.used,
-          threshold: this.thresholds.heap.warning
-        });
-        this.alerts.set('heap-warning', now);
-      }
-    }
+
     
     // Alerta de memoria sistema
     if (metrics.system.usagePercent > this.thresholds.memory.critical) {
@@ -212,7 +172,6 @@ class ResourceMonitor {
   storeSample(metrics) {
     this.samples.push({
       timestamp: metrics.timestamp,
-      heapMB: Math.round(metrics.heap.used / 1024 / 1024),
       systemPercent: Math.round(metrics.system.usagePercent),
       cpuPercent: Math.round(metrics.cpu.percent),
       handles: metrics.handles,
@@ -235,22 +194,16 @@ class ResourceMonitor {
     if (older.length === 0) return null;
     
     const recentAvg = {
-      heap: recent.reduce((sum, s) => sum + s.heapMB, 0) / recent.length,
       cpu: recent.reduce((sum, s) => sum + s.cpuPercent, 0) / recent.length,
       handles: recent.reduce((sum, s) => sum + s.handles, 0) / recent.length
     };
     
     const olderAvg = {
-      heap: older.reduce((sum, s) => sum + s.heapMB, 0) / older.length,
       cpu: older.reduce((sum, s) => sum + s.cpuPercent, 0) / older.length,
       handles: older.reduce((sum, s) => sum + s.handles, 0) / older.length
     };
     
     return {
-      heap: {
-        trend: recentAvg.heap - olderAvg.heap,
-        direction: recentAvg.heap > olderAvg.heap ? '📈' : '📉'
-      },
       cpu: {
         trend: recentAvg.cpu - olderAvg.cpu,
         direction: recentAvg.cpu > olderAvg.cpu ? '📈' : '📉'
@@ -269,7 +222,7 @@ class ResourceMonitor {
     this.storeSample(metrics);
     
     // Log básico cada vez
-    console.log(`📊 Resources - Heap: ${(metrics.heap.used/1024/1024).toFixed(1)}MB | CPU: ${metrics.cpu.percent.toFixed(1)}% | Handles: ${metrics.handles} | Uptime: ${(metrics.uptime/3600).toFixed(1)}h`);
+    console.log(`📊 Resources - CPU: ${metrics.cpu.percent.toFixed(1)}% | Handles: ${metrics.handles} | System: ${metrics.system.usagePercent.toFixed(1)}% | Uptime: ${(metrics.uptime/3600).toFixed(1)}h`);
     
     // Mostrar alertas
     alerts.forEach(alert => {
@@ -279,8 +232,7 @@ class ResourceMonitor {
     // Log detallado cada 10 muestras
     if (this.samples.length % 10 === 0) {
       console.log('🔍 Métricas detalladas:');
-      console.log(`   💾 Heap: usado=${(metrics.heap.used/1024/1024).toFixed(1)}MB, total=${(metrics.heap.total/1024/1024).toFixed(1)}MB`);
-      console.log(`   🖥️  Sistema: ${metrics.system.usagePercent.toFixed(1)}% (${(metrics.system.used/1024/1024/1024).toFixed(1)}GB de ${(metrics.system.total/1024/1024/1024).toFixed(1)}GB)`);
+      console.log(`   ️  Sistema: ${metrics.system.usagePercent.toFixed(1)}% (${(metrics.system.used/1024/1024/1024).toFixed(1)}GB de ${(metrics.system.total/1024/1024/1024).toFixed(1)}GB)`);
       console.log(`   ⚡ CPU: ${metrics.cpu.percent.toFixed(1)}% | Load: [${metrics.cpu.loadAverage.map(l => l.toFixed(2)).join(', ')}]`);
       console.log(`   🔗 Conexiones: handles=${metrics.handles}, requests=${metrics.requests}`);
       console.log(`   🚨 Errores acum: 428=${metrics.errors['428']}, 440=${metrics.errors['440']}, MAC=${metrics.errors['MAC']}, reconex=${metrics.errors.reconnections}, sigterm=${metrics.errors.sigterm}`);
@@ -288,7 +240,7 @@ class ResourceMonitor {
       // Mostrar tendencias si las hay
       const trends = this.getTrends();
       if (trends) {
-        console.log(`   📈 Tendencias: Heap ${trends.heap.direction}${trends.heap.trend.toFixed(1)}MB, CPU ${trends.cpu.direction}${trends.cpu.trend.toFixed(1)}%, Handles ${trends.handles.direction}${trends.handles.trend.toFixed(0)}`);
+        console.log(`   📈 Tendencias: CPU ${trends.cpu.direction}${trends.cpu.trend.toFixed(1)}%, Handles ${trends.handles.direction}${trends.handles.trend.toFixed(0)}`);
       }
     }
     
@@ -325,7 +277,6 @@ class ResourceMonitor {
       timestamp: metrics.timestamp,
       uptime: metrics.uptime,
       current: {
-        heapMB: Math.round(metrics.heap.used / 1024 / 1024),
         systemPercent: Math.round(metrics.system.usagePercent),
         cpuPercent: Math.round(metrics.cpu.percent),
         handles: metrics.handles

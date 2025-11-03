@@ -5056,7 +5056,7 @@ setTimeout(() => {
       resourceMonitor.logMetrics();
     } catch (error) {
       console.error('❌ Error en logMetrics:', error.message);
-      console.log(`📊 Fallback - Uptime: ${(process.uptime()/3600).toFixed(1)}h | Heap: ${(process.memoryUsage().heapUsed/1024/1024).toFixed(1)}MB`);
+      console.log(`📊 Fallback - Uptime: ${(process.uptime()/3600).toFixed(1)}h | System Memory: ${(((require('os').totalmem() - require('os').freemem()) / require('os').totalmem()) * 100).toFixed(1)}%`);
     }
   }, 60000);
   
@@ -5066,10 +5066,12 @@ setTimeout(() => {
       resourceMonitor.checkAlerts();
     } catch (error) {
       console.error('❌ Error en checkAlerts:', error.message);
-      // Fallback básico: solo log de memoria si está alta
-      const heapMB = process.memoryUsage().heapUsed / 1024 / 1024;
-      if (heapMB > 200) {
-        console.warn(`⚠️ Memoria heap alta: ${heapMB.toFixed(1)}MB`);
+      // Fallback básico: solo log de memoria del sistema
+      const totalMem = require('os').totalmem();
+      const freeMem = require('os').freemem();
+      const memoryPercent = ((totalMem - freeMem) / totalMem) * 100;
+      if (memoryPercent > 80) {
+        console.warn(`⚠️ Memoria sistema alta: ${memoryPercent.toFixed(1)}%`);
       }
     }
   }, 30000);
